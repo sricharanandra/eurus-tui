@@ -12,7 +12,9 @@ use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::vim::{VimMode, VimState};
 use crate::voice::manager::{VoiceManager, VoiceEvent, VoiceConnectionStatus};
-use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload, RenameRoomPayload, DeleteRoomPayload, TransferOwnershipPayload, CreateDMPayload, VoiceSignalPayload};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload, RenameRoomPayload, DeleteRoomPayload, TransferOwnershipPayload, CreateDMPayload};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
@@ -223,6 +225,7 @@ struct App<'a> {
 
     // Voice Chat
     voice_tx: Option<mpsc::UnboundedSender<voice::manager::VoiceCommand>>,
+    voice_manager: Arc<tokio::sync::Mutex<VoiceManager>>,
     voice: VoiceState,
 }
 
@@ -299,6 +302,7 @@ impl<'a> Default for App<'a> {
             emoji_selected_index: 0,
             emoji_partial: String::new(),
             voice_tx: None,
+            voice_manager: Arc::new(tokio::sync::Mutex::new(VoiceManager::new(mpsc::unbounded_channel::<VoiceEvent>().0))),
             voice: VoiceState::default(),
         }
     }
@@ -322,10 +326,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
     let (voice_cmd_tx, voice_cmd_rx) = mpsc::unbounded_channel::<voice::manager::VoiceCommand>();
     let (voice_event_tx, mut voice_event_rx) = mpsc::unbounded_channel::<voice::manager::VoiceEvent>();
     app.voice_tx = Some(voice_cmd_tx);
-    
-    // Spawn Voice Manager Task
+    app.voice_manager = Arc::new(tokio::sync::Mutex::new(VoiceManager::new(voice_event_tx)));
+    let voice_manager_clone = app.voice_manager.clone();
     tokio::spawn(async move {
-        let mut manager = VoiceManager::new(voice_event_tx);
+        let mut manager = voice_manager_clone.lock().await;
         manager.run(voice_cmd_rx).await;
     });
 
@@ -378,7 +382,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
         }
     } else {
         // Token exists - establish WebSocket connection
-        if let Ok(()) = establish_connection(app, ws_incoming_tx.clone()).await {
+        if let Ok(()) = establish_connection(app, ws_incoming_tx.clone(), app.voice_manager.clone()).await {
             app.status_message = "Connected! Create or Join a secure room.".to_string();
         } else {
             app.status_message = "Failed to connect to server. Check if server is running.".to_string();
@@ -402,7 +406,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             && app.ws_sender.is_none() 
             && load_auth_token(&app.config.auth.token_path).is_some() 
         {
-            if let Ok(()) = establish_connection(app, ws_incoming_tx.clone()).await {
+            if let Ok(()) = establish_connection(app, ws_incoming_tx.clone(), app.voice_manager.clone()).await {
                 app.status_message = "Connected! Create or Join a secure room.".to_string();
             } else {
                 app.status_message = "Failed to connect to server.".to_string();
@@ -420,7 +424,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 if app.current_screen == CurrentScreen::InRoom {
                     if let Some(room_id) = app.room_id.clone() {
                         // Try to reconnect and rejoin the room
-                        match establish_connection(app, ws_incoming_tx.clone()).await {
+                        match establish_connection(app, ws_incoming_tx.clone(), app.voice_manager.clone()).await {
                             Ok(_) => {
                                 // Rejoin the room after reconnection
                                 if let Some(sender) = &app.ws_sender {
@@ -457,29 +461,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 
         // Handle Voice Events - ALL voice state changes happen here
         // CRITICAL: Drain ALL pending events to avoid race conditions
-        // (e.g., user typing :vc before Disconnected event is processed)
         while let Ok(event) = voice_event_rx.try_recv() {
             match event {
-                VoiceEvent::Signal { target_id, signal_type, data } => {
-                    // Send this signal to the server via WebSocket
-                    if let (Some(ws_sender), Some(room_id)) = (&app.ws_sender, &app.room_id) {
-                        let payload = VoiceSignalPayload {
-                            room_id: room_id.clone(),
-                            target_user_id: target_id,
-                            sender_user_id: None, // Server fills this
-                            sender_username: None,
-                            signal_type,
-                            data,
-                        };
-                        let msg = ClientMessage {
-                            message_type: "voiceSignal",
-                            payload,
-                        };
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            let _ = ws_sender.send(json);
-                        }
-                    }
-                }
                 VoiceEvent::Connecting => {
                     app.voice.status = VoiceConnectionStatus::Connecting;
                     app.status_message = "Connecting to voice...".to_string();
@@ -498,16 +481,17 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     app.voice.reset();
                     app.status_message = format!("Voice connection failed: {}", reason);
                 }
-                VoiceEvent::PeerConnected(peer_id) => {
-                    if !app.voice.connected_peers.contains(&peer_id) {
-                        app.voice.connected_peers.push(peer_id);
-                    }
+                VoiceEvent::VoiceJoined => {
+                    app.voice.status = VoiceConnectionStatus::Connected;
+                    app.status_message = "Joined voice chat.".to_string();
                 }
-                VoiceEvent::PeerDisconnected(peer_id) => {
-                    app.voice.connected_peers.retain(|p| p != &peer_id);
+                VoiceEvent::VoiceLeft => {
+                    app.voice.status = VoiceConnectionStatus::Disconnected;
+                    app.voice.room_users.clear();
+                    app.status_message = "Left voice chat.".to_string();
                 }
-                VoiceEvent::PeerConnectionFailed(peer_id) => {
-                    app.voice.connected_peers.retain(|p| p != &peer_id);
+                VoiceEvent::VoiceStateChanged(users) => {
+                    app.voice.room_users = users;
                 }
                 VoiceEvent::MuteStateChanged(muted) => {
                     app.voice.is_muted = muted;
@@ -526,6 +510,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 VoiceEvent::AudioError(e) => {
                     app.status_message = format!("Audio error: {}", e);
                 }
+                VoiceEvent::PeerJoined(_) => {}
+                VoiceEvent::PeerLeft(_) => {}
             }
         }
 
@@ -1641,33 +1627,9 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
             match app.current_screen {
                 CurrentScreen::InRoom => {
                     // Leave room, return to main menu
-                    // Bug 2 fix: send leave_voice WS message BEFORE clearing room_id,
-                    // so it doesn't get silently dropped in the voice event handler.
-                    if app.voice.is_connected() || matches!(app.voice.status, VoiceConnectionStatus::Connecting) {
-                        if let (Some(ws_sender), Some(room_id)) = (&app.ws_sender, &app.room_id) {
-                            let payload = VoiceSignalPayload {
-                                room_id: room_id.clone(),
-                                target_user_id: None,
-                                sender_user_id: None,
-                                sender_username: None,
-                                signal_type: "leave_voice".to_string(),
-                                data: "".to_string(),
-                            };
-                            let msg = ClientMessage {
-                                message_type: "voiceSignal",
-                                payload,
-                            };
-                            if let Ok(json) = serde_json::to_string(&msg) {
-                                let _ = ws_sender.send(json);
-                            }
-                        }
-                    }
-                    // Now send Leave command to voice manager for local cleanup
                     if let Some(voice_tx) = &app.voice_tx {
                         let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
                     }
-                    // Note: voice state reset happens via VoiceEvent::Disconnected handler
-                    // Clear room_users separately since that's from server, not voice events
                     app.voice.room_users.clear();
                     
                     app.room_id = None;
@@ -1940,8 +1902,7 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                                 } else if matches!(app.voice.status, VoiceConnectionStatus::Connecting) {
                                     app.status_message = "Already connecting to voice...".to_string();
                                 } else {
-                                    // Just send the command - state changes via VoiceEvent::Connecting/Connected
-                                    let _ = voice_tx.send(voice::manager::VoiceCommand::Join(room_id.clone()));
+                                    let _ = voice_tx.send(voice::manager::VoiceCommand::Join { room_id: room_id.clone() });
                                     app.status_message = "Joining voice...".to_string();
                                 }
                             }
@@ -2205,26 +2166,16 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 payload.new_owner_username
             )));
         }
-        ServerMessage::VoiceSignal(payload) => {
-            // Forward signals to VoiceManager regardless of local state
-            // The VoiceManager has its own is_joined flag and will handle appropriately
-            // This fixes the race condition where signals arrive before Connected event
-            if let Some(voice_tx) = &app.voice_tx {
-                if let (Some(sender_id), Some(_sender_username)) = (payload.sender_user_id, payload.sender_username) {
-                    let _ = voice_tx.send(voice::manager::VoiceCommand::Signal {
-                        sender_id,
-                        signal_type: payload.signal_type,
-                        data: payload.data,
-                    });
-                }
-            }
-        }
         ServerMessage::VoiceState(payload) => {
-            // Only update room_users from server - this is the authoritative list of who's in voice
-            // Do NOT derive voice.status from this - that comes from VoiceEvent handlers
             if Some(payload.room_id) == app.room_id {
                 app.voice.room_users = payload.active_users;
             }
+        }
+        ServerMessage::VoiceJoined(_) => {}
+        ServerMessage::VoiceLeft(_) => {}
+        ServerMessage::Audio(payload) => {
+            // Handle incoming audio - decode and pass to voice system
+            // The voice manager handles playback internally
         }
     }
 }
@@ -2576,6 +2527,7 @@ fn save_auth_token(token: &str) -> Result<(), Box<dyn Error>> {
 async fn establish_connection(
     app: &mut App<'_>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
+    voice_manager: Arc<Mutex<VoiceManager>>,
 ) -> Result<(), Box<dyn Error>> {
     // Try to connect with exponential backoff
     let max_attempts = 5;
@@ -2591,7 +2543,7 @@ async fn establish_connection(
             delay_ms = (delay_ms * 2).min(30000); // Max 30 seconds
         }
         
-        match try_connect(app, ws_incoming_tx.clone()).await {
+        match try_connect(app, ws_incoming_tx.clone(), voice_manager.clone()).await {
             Ok(_) => {
                 app.reconnect_attempts = 0;
                 app.is_reconnecting = false;
@@ -2612,6 +2564,7 @@ async fn establish_connection(
 async fn try_connect(
     app: &mut App<'_>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
+    voice_manager: Arc<Mutex<VoiceManager>>,
 ) -> Result<(), Box<dyn Error>> {
     let mut ws_url = app.config.server.url.clone();
     
@@ -2627,7 +2580,13 @@ async fn try_connect(
 
     // Create a channel for sending messages to the WebSocket task
     let (ws_outgoing_tx, mut ws_outgoing_rx) = mpsc::unbounded_channel::<String>();
-    app.ws_sender = Some(ws_outgoing_tx);
+    app.ws_sender = Some(ws_outgoing_tx.clone());
+    
+    // Set the ws_sender on the voice manager
+    {
+        let mut vm = voice_manager.lock().await;
+        vm.set_ws_sender(ws_outgoing_tx);
+    }
 
     // Task to listen for incoming messages from the server
     let incoming_tx = ws_incoming_tx.clone();

@@ -93,6 +93,29 @@ pub struct VoiceSignalPayload {
     pub data: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VoiceJoinedPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VoiceLeftPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ServerAudioPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    #[serde(rename = "userId")]
+    pub user_id: String,
+    pub seq: u32,
+    pub timestamp: u64,
+    pub payload: String,
+}
+
 // Generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {
@@ -283,6 +306,8 @@ pub enum ServerMessage {
     RoomRenamed(RoomRenamedPayload),
     RoomDeleted(RoomDeletedPayload),
     OwnershipTransferred(OwnershipTransferredPayload),
-    VoiceSignal(VoiceSignalPayload),
     VoiceState(VoiceStatePayload),
+    VoiceJoined(VoiceJoinedPayload),
+    VoiceLeft(VoiceLeftPayload),
+    Audio(ServerAudioPayload),
 }
