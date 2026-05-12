@@ -409,6 +409,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     app.is_reconnecting = false;
                     app.next_connect_time = None;
                     
+                    if let Some(voice_tx) = &app.voice_tx {
+                        let _ = voice_tx.send(voice::manager::VoiceCommand::ConnectionStatusChanged(true));
+                    }
+                    
                     if app.current_screen == CurrentScreen::InRoom {
                         if let Some(room_id) = app.room_id.clone() {
                             let join_payload = JoinRoomPayload {
@@ -474,6 +478,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             if text == "__DISCONNECT__" {
                 app.messages.push(ChatMessage::system("[SYSTEM] Connection lost. Attempting to reconnect...".to_string()));
                 app.ws_sender = None;
+                
+                if let Some(voice_tx) = &app.voice_tx {
+                    let _ = voice_tx.send(voice::manager::VoiceCommand::ConnectionStatusChanged(false));
+                }
                 
                 app.connect_delay_ms = 1000;
                 app.next_connect_time = Some(std::time::Instant::now() + std::time::Duration::from_millis(app.connect_delay_ms));
@@ -2058,6 +2066,10 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         }
         ServerMessage::RoomJoined(payload) => {
             app.status_message = format!("Joined room: {}", payload.display_name);
+            
+            if let Some(voice_tx) = &app.voice_tx {
+                let _ = voice_tx.send(voice::manager::VoiceCommand::RoomJoined);
+            }
             
             // Force switch to InRoom screen
             app.current_screen = CurrentScreen::InRoom;

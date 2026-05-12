@@ -66,6 +66,8 @@ pub enum VoiceCommand {
     AudioData(Vec<u8>),
     SetWsSender(mpsc::UnboundedSender<String>),
     ServerAudio(crate::api::ServerAudioPayload),
+    ConnectionStatusChanged(bool), // true = connected, false = disconnected
+    RoomJoined,
 }
 
 pub struct VoiceManager {
@@ -138,6 +140,23 @@ impl VoiceManager {
                         }
                         VoiceCommand::ServerAudio(payload) => {
                             self.handle_server_audio(payload).await;
+                        }
+                        VoiceCommand::ConnectionStatusChanged(connected) => {
+                            let mut state = self.state.lock().await;
+                            if connected {
+                                if *state == VoiceState::Disconnected {
+                                    *state = VoiceState::Connected;
+                                }
+                            } else {
+                                *state = VoiceState::Disconnected;
+                                self.reset_voice_state_internal().await;
+                            }
+                        }
+                        VoiceCommand::RoomJoined => {
+                            let mut state = self.state.lock().await;
+                            if *state == VoiceState::Connected || *state == VoiceState::Disconnected {
+                                *state = VoiceState::InRoom;
+                            }
                         }
                     }
                 }
@@ -323,16 +342,20 @@ impl VoiceManager {
         let _ = self.event_tx.send(VoiceEvent::TxActivity(true));
     }
 
-    async fn reset_voice_state(&self) {
-        {
-            let mut state = self.state.lock().await;
-            *state = VoiceState::InRoom;
-        }
+    async fn reset_voice_state_internal(&self) {
         self.seq.store(0, Ordering::Relaxed);
         self.timestamp.store(0, Ordering::Relaxed);
         self.send_queue.lock().await.clear();
         let _ = self.event_tx.send(VoiceEvent::TxActivity(false));
         let _ = self.event_tx.send(VoiceEvent::MuteStateChanged(false));
+    }
+
+    async fn reset_voice_state(&self) {
+        {
+            let mut state = self.state.lock().await;
+            *state = VoiceState::InRoom;
+        }
+        self.reset_voice_state_internal().await;
     }
 
     pub async fn set_state(&self, state: VoiceState) {
