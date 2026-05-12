@@ -64,6 +64,8 @@ pub enum VoiceCommand {
     Leave,
     Mute(bool),
     AudioData(Vec<u8>),
+    SetWsSender(mpsc::UnboundedSender<String>),
+    ServerAudio(crate::api::ServerAudioPayload),
 }
 
 pub struct VoiceManager {
@@ -130,6 +132,12 @@ impl VoiceManager {
                         }
                         VoiceCommand::AudioData(data) => {
                             self.handle_audio_data(data).await;
+                        }
+                        VoiceCommand::SetWsSender(sender) => {
+                            self.set_ws_sender(sender);
+                        }
+                        VoiceCommand::ServerAudio(payload) => {
+                            self.handle_server_audio(payload).await;
                         }
                     }
                 }
@@ -343,6 +351,28 @@ impl VoiceManager {
     pub async fn set_status(&self, status: VoiceConnectionStatus) {
         let mut current = self.status.lock().await;
         *current = status;
+    }
+
+    async fn handle_server_audio(&self, payload: crate::api::ServerAudioPayload) {
+        let audio_data = match general_purpose::STANDARD.decode(&payload.payload) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = self.event_tx.send(VoiceEvent::AudioError(format!("Decode error: {}", e)));
+                return;
+            }
+        };
+
+        let audio = self.audio_engine.clone();
+        let user_id = payload.user_id.clone();
+        tokio::spawn(async move {
+            let (packet_tx, packet_rx) = mpsc::unbounded_channel();
+            let _ = packet_tx.send(audio_data);
+
+            let mut engine = audio.lock().await;
+            if let Err(e) = engine.start_playback_for_peer(&user_id, packet_rx) {
+                eprintln!("[VOICE] Playback error for {}: {}", user_id, e);
+            }
+        });
     }
 
     pub fn parse_server_message(&self, json: &str) -> Option<VoiceEvent> {

@@ -228,7 +228,6 @@ struct App<'a> {
 
     // Voice Chat
     voice_tx: Option<mpsc::UnboundedSender<voice::manager::VoiceCommand>>,
-    voice_manager: Arc<tokio::sync::Mutex<VoiceManager>>,
     voice: VoiceState,
 }
 
@@ -308,7 +307,6 @@ impl<'a> Default for App<'a> {
             emoji_selected_index: 0,
             emoji_partial: String::new(),
             voice_tx: None,
-            voice_manager: Arc::new(tokio::sync::Mutex::new(VoiceManager::new(mpsc::unbounded_channel::<VoiceEvent>().0))),
             voice: VoiceState::default(),
         }
     }
@@ -332,11 +330,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
     let (voice_cmd_tx, voice_cmd_rx) = mpsc::unbounded_channel::<voice::manager::VoiceCommand>();
     let (voice_event_tx, mut voice_event_rx) = mpsc::unbounded_channel::<voice::manager::VoiceEvent>();
     app.voice_tx = Some(voice_cmd_tx);
-    app.voice_manager = Arc::new(tokio::sync::Mutex::new(VoiceManager::new(voice_event_tx)));
-    let voice_manager_clone = app.voice_manager.clone();
+    
+    let mut voice_manager = VoiceManager::new(voice_event_tx);
     tokio::spawn(async move {
-        let mut manager = voice_manager_clone.lock().await;
-        manager.run(voice_cmd_rx).await;
+        voice_manager.run(voice_cmd_rx).await;
     });
 
     // Check if user is registered (has auth token)
@@ -791,9 +788,10 @@ async fn handle_username_input_screen(app: &mut App<'_>, key: event::KeyEvent) {
                                 app.current_screen = CurrentScreen::RegistrationSuccess;
                                 app.status_message = "Registration successful!".to_string();
                             }
-            Err(e) => {
-                let _ = tx.send(Err(format!("Failed to connect to {}: {}", ws_url, e)));
-            }
+                            Err(e) => {
+                                app.registration_error = Some(e.to_string());
+                                app.status_message = format!("Registration failed: {}", e);
+                            }
                         }
                     }
                     Err(e) => {
@@ -2205,8 +2203,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::VoiceJoined(_) => {}
         ServerMessage::VoiceLeft(_) => {}
         ServerMessage::Audio(payload) => {
-            // Handle incoming audio - decode and pass to voice system
-            // The voice manager handles playback internally
+            if let Some(voice_tx) = &app.voice_tx {
+                let _ = voice_tx.send(voice::manager::VoiceCommand::ServerAudio(payload.clone()));
+            }
         }
     }
 }
@@ -2572,15 +2571,14 @@ fn start_background_connection(
     let ws_url = app.config.server.url.clone();
     let token = load_auth_token(&app.config.auth.token_path);
     let incoming_tx = ws_incoming_tx.clone();
-    let voice_manager = app.voice_manager.clone();
+    let voice_tx = app.voice_tx.clone();
 
     tokio::spawn(async move {
-        match try_connect(ws_url, token, incoming_tx, voice_manager).await {
+        match try_connect(ws_url, token, incoming_tx, voice_tx).await {
             Ok(ws_sender) => {
                 let _ = tx.send(Ok(ws_sender));
             }
             Err(e) => {
-                let _ = std::fs::write("/tmp/eurus_conn_error.log", e.to_string());
                 let _ = tx.send(Err(e.to_string()));
             }
         }
@@ -2591,7 +2589,7 @@ async fn try_connect(
     mut ws_url: String,
     token: Option<String>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
-    voice_manager: Arc<tokio::sync::Mutex<VoiceManager>>,
+    voice_tx: Option<mpsc::UnboundedSender<voice::manager::VoiceCommand>>,
 ) -> Result<mpsc::UnboundedSender<String>, Box<dyn std::error::Error + Send + Sync>> {
     // Append token as query parameter
     if let Some(t) = token {
@@ -2599,16 +2597,20 @@ async fn try_connect(
         ws_url = format!("{}{}token={}", ws_url, separator, t);
     }
     
-    let (ws_stream, _) = connect_async(&ws_url).await?;
+    let connect_future = connect_async(&ws_url);
+    let (ws_stream, _) = match tokio::time::timeout(std::time::Duration::from_secs(5), connect_future).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err("Connection timed out after 5 seconds".into()),
+    };
     let (mut write, mut read) = ws_stream.split();
 
     // Create a channel for sending messages to the WebSocket task
     let (ws_outgoing_tx, mut ws_outgoing_rx) = mpsc::unbounded_channel::<String>();
     
-    // Set the ws_sender on the voice manager
-    {
-        let mut vm = voice_manager.lock().await;
-        vm.set_ws_sender(ws_outgoing_tx.clone());
+    // Send the ws_sender to the voice manager
+    if let Some(tx) = voice_tx {
+        let _ = tx.send(voice::manager::VoiceCommand::SetWsSender(ws_outgoing_tx.clone()));
     }
 
     // Task to listen for incoming messages from the server
