@@ -791,10 +791,9 @@ async fn handle_username_input_screen(app: &mut App<'_>, key: event::KeyEvent) {
                                 app.current_screen = CurrentScreen::RegistrationSuccess;
                                 app.status_message = "Registration successful!".to_string();
                             }
-                            Err(e) => {
-                                app.registration_error = Some(e.to_string());
-                                app.status_message = format!("Registration failed: {}", e);
-                            }
+            Err(e) => {
+                let _ = tx.send(Err(format!("Failed to connect to {}: {}", ws_url, e)));
+            }
                         }
                     }
                     Err(e) => {
@@ -2581,6 +2580,7 @@ fn start_background_connection(
                 let _ = tx.send(Ok(ws_sender));
             }
             Err(e) => {
+                let _ = std::fs::write("/tmp/eurus_conn_error.log", e.to_string());
                 let _ = tx.send(Err(e.to_string()));
             }
         }
