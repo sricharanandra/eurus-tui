@@ -41,7 +41,7 @@ pub struct NetworkConfig {
 }
 
 fn default_server_url() -> String {
-    std::env::var("EURUS_SERVER_URL").unwrap_or_else(|_| "wss://eurus.sreus.tech/ws".to_string())
+    std::env::var("EURUS_SERVER_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080".to_string())
 }
 
 fn default_token_path() -> String {

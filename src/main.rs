@@ -199,6 +199,9 @@ struct App<'a> {
     ws_sender: Option<mpsc::UnboundedSender<String>>,
     reconnect_attempts: usize,
     is_reconnecting: bool,
+    next_connect_time: Option<std::time::Instant>,
+    connect_delay_ms: u64,
+    conn_rx: Option<mpsc::UnboundedReceiver<Result<mpsc::UnboundedSender<String>, String>>>,
     
     // Clipboard & Config
     clipboard: Option<ClipboardManager>,
@@ -272,6 +275,9 @@ impl<'a> Default for App<'a> {
             ws_sender: None,
             reconnect_attempts: 0,
             is_reconnecting: false,
+            next_connect_time: None,
+            connect_delay_ms: 1000,
+            conn_rx: None,
             clipboard,
             config: Config::load(),
             vim_state: VimState::default(),
@@ -381,12 +387,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             app.status_message = format!("Welcome! Select an SSH key ({}).", source);
         }
     } else {
-        // Token exists - establish WebSocket connection
-        if let Ok(()) = establish_connection(app, ws_incoming_tx.clone(), app.voice_manager.clone()).await {
-            app.status_message = "Connected! Create or Join a secure room.".to_string();
-        } else {
-            app.status_message = "Failed to connect to server. Check if server is running.".to_string();
-        }
+        // Token exists - start background connection
+        start_background_connection(app, ws_incoming_tx.clone());
     }
 
     loop {
@@ -401,15 +403,71 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             break;
         }
 
-        // Establish connection after registration completes
-        if app.current_screen == CurrentScreen::RoomChoice 
-            && app.ws_sender.is_none() 
-            && load_auth_token(&app.config.auth.token_path).is_some() 
-        {
-            if let Ok(()) = establish_connection(app, ws_incoming_tx.clone(), app.voice_manager.clone()).await {
-                app.status_message = "Connected! Create or Join a secure room.".to_string();
-            } else {
-                app.status_message = "Failed to connect to server.".to_string();
+        // Process connection result
+        if let Some(mut conn_rx) = app.conn_rx.take() {
+            match conn_rx.try_recv() {
+                Ok(Ok(ws_sender)) => {
+                    app.ws_sender = Some(ws_sender.clone());
+                    app.reconnect_attempts = 0;
+                    app.is_reconnecting = false;
+                    app.next_connect_time = None;
+                    
+                    if app.current_screen == CurrentScreen::InRoom {
+                        if let Some(room_id) = app.room_id.clone() {
+                            let join_payload = JoinRoomPayload {
+                                room_id: Some(&room_id),
+                                room_name: None,
+                            };
+                            let join_msg = ClientMessage {
+                                message_type: "joinRoom",
+                                payload: join_payload,
+                            };
+                            if let Ok(json) = serde_json::to_string(&join_msg) {
+                                let _ = ws_sender.send(json);
+                            }
+                            app.messages.push(ChatMessage::system("[SYSTEM] Reconnected successfully!".to_string()));
+                        }
+                    } else {
+                        app.status_message = "Connected! Create or Join a secure room.".to_string();
+                    }
+                }
+                Ok(Err(e)) => {
+                    app.reconnect_attempts += 1;
+                    if app.reconnect_attempts >= 5 {
+                        app.status_message = format!("Failed to connect after 5 attempts: {}", e);
+                        if app.current_screen == CurrentScreen::InRoom {
+                            app.messages.push(ChatMessage::system(format!("[SYSTEM] Connection failed: {}", e)));
+                        }
+                        app.is_reconnecting = false;
+                        app.reconnect_attempts = 0; // reset to allow manual retry
+                    } else {
+                        app.status_message = format!("Connection failed ({}). Retrying...", e);
+                        app.connect_delay_ms = (app.connect_delay_ms * 2).min(30000);
+                        app.next_connect_time = Some(std::time::Instant::now() + std::time::Duration::from_millis(app.connect_delay_ms));
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    // Still connecting, put it back
+                    app.conn_rx = Some(conn_rx);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    app.status_message = "Connection task died unexpectedly.".to_string();
+                    app.is_reconnecting = false;
+                }
+            }
+        }
+
+        // Handle auto-reconnect backoff
+        if app.ws_sender.is_none() && app.conn_rx.is_none() {
+            if let Some(next_time) = app.next_connect_time {
+                if std::time::Instant::now() >= next_time {
+                    app.next_connect_time = None;
+                    start_background_connection(app, ws_incoming_tx.clone());
+                }
+            } else if app.current_screen == CurrentScreen::RoomChoice && load_auth_token(&app.config.auth.token_path).is_some() && !app.is_reconnecting {
+                // Initial connection if token exists and not in backoff
+                // start_background_connection(app, ws_incoming_tx.clone()); 
+                // We already do this at startup, so we don't automatically loop here unless next_connect_time is set.
             }
         }
 
@@ -420,34 +478,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 app.messages.push(ChatMessage::system("[SYSTEM] Connection lost. Attempting to reconnect...".to_string()));
                 app.ws_sender = None;
                 
-                // Attempt reconnection in background
-                if app.current_screen == CurrentScreen::InRoom {
-                    if let Some(room_id) = app.room_id.clone() {
-                        // Try to reconnect and rejoin the room
-                        match establish_connection(app, ws_incoming_tx.clone(), app.voice_manager.clone()).await {
-                            Ok(_) => {
-                                // Rejoin the room after reconnection
-                                if let Some(sender) = &app.ws_sender {
-                                    let join_payload = JoinRoomPayload {
-                                        room_id: Some(&room_id),
-                                        room_name: None,
-                                    };
-                                    let join_msg = ClientMessage {
-                                        message_type: "joinRoom",
-                                        payload: join_payload,
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&join_msg) {
-                                        let _ = sender.send(json);
-                                    }
-                                }
-                                app.messages.push(ChatMessage::system("[SYSTEM] Reconnected successfully!".to_string()));
-                            }
-                            Err(_) => {
-                                app.messages.push(ChatMessage::system("[SYSTEM] Failed to reconnect. Please restart.".to_string()));
-                            }
-                        }
-                    }
-                }
+                app.connect_delay_ms = 1000;
+                app.next_connect_time = Some(std::time::Instant::now() + std::time::Duration::from_millis(app.connect_delay_ms));
             } else {
                 match serde_json::from_str::<ServerMessage>(&text) {
                     Ok(server_msg) => handle_server_message(app, server_msg),
@@ -2524,55 +2556,47 @@ fn save_auth_token(token: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn establish_connection(
+fn start_background_connection(
     app: &mut App<'_>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
-    voice_manager: Arc<Mutex<VoiceManager>>,
-) -> Result<(), Box<dyn Error>> {
-    // Try to connect with exponential backoff
-    let max_attempts = 5;
-    let mut delay_ms = 1000;
-    
-    for attempt in 0..max_attempts {
-        app.reconnect_attempts = attempt;
-        app.is_reconnecting = attempt > 0;
-        
-        if attempt > 0 {
-            app.status_message = format!("Reconnecting... attempt {}/{}", attempt + 1, max_attempts);
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-            delay_ms = (delay_ms * 2).min(30000); // Max 30 seconds
-        }
-        
-        match try_connect(app, ws_incoming_tx.clone(), voice_manager.clone()).await {
-            Ok(_) => {
-                app.reconnect_attempts = 0;
-                app.is_reconnecting = false;
-                app.status_message = "Connected".to_string();
-                return Ok(());
-            }
-            Err(e) if attempt == max_attempts - 1 => {
-                app.status_message = format!("Connection failed: {}", e);
-                return Err(e);
-            }
-            Err(_) => continue,
-        }
+) {
+    if app.conn_rx.is_some() || app.ws_sender.is_some() {
+        return; // Already connecting or connected
     }
     
-    Err("Failed to connect after multiple attempts".into())
+    app.is_reconnecting = true;
+    app.status_message = format!("Connecting to server (Attempt {}/5)...", app.reconnect_attempts + 1);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    app.conn_rx = Some(rx);
+
+    let ws_url = app.config.server.url.clone();
+    let token = load_auth_token(&app.config.auth.token_path);
+    let incoming_tx = ws_incoming_tx.clone();
+    let voice_manager = app.voice_manager.clone();
+
+    tokio::spawn(async move {
+        match try_connect(ws_url, token, incoming_tx, voice_manager).await {
+            Ok(ws_sender) => {
+                let _ = tx.send(Ok(ws_sender));
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+            }
+        }
+    });
 }
 
 async fn try_connect(
-    app: &mut App<'_>,
+    mut ws_url: String,
+    token: Option<String>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
-    voice_manager: Arc<Mutex<VoiceManager>>,
-) -> Result<(), Box<dyn Error>> {
-    let mut ws_url = app.config.server.url.clone();
-    
-    // Try to load token and append to URL
-    if let Some(token) = load_auth_token(&app.config.auth.token_path) {
-        // Append token as query parameter
+    voice_manager: Arc<tokio::sync::Mutex<VoiceManager>>,
+) -> Result<mpsc::UnboundedSender<String>, Box<dyn std::error::Error + Send + Sync>> {
+    // Append token as query parameter
+    if let Some(t) = token {
         let separator = if ws_url.contains('?') { '&' } else { '?' };
-        ws_url = format!("{}{}token={}", ws_url, separator, token);
+        ws_url = format!("{}{}token={}", ws_url, separator, t);
     }
     
     let (ws_stream, _) = connect_async(&ws_url).await?;
@@ -2580,12 +2604,11 @@ async fn try_connect(
 
     // Create a channel for sending messages to the WebSocket task
     let (ws_outgoing_tx, mut ws_outgoing_rx) = mpsc::unbounded_channel::<String>();
-    app.ws_sender = Some(ws_outgoing_tx.clone());
     
     // Set the ws_sender on the voice manager
     {
         let mut vm = voice_manager.lock().await;
-        vm.set_ws_sender(ws_outgoing_tx);
+        vm.set_ws_sender(ws_outgoing_tx.clone());
     }
 
     // Task to listen for incoming messages from the server
@@ -2606,22 +2629,21 @@ async fn try_connect(
                 }
             }
         }
+        let _ = incoming_tx.send("__DISCONNECT__".to_string());
     });
 
-    // Task to send outgoing messages from the app to the server, with periodic pings
+    // Task to send outgoing messages to the server
     tokio::spawn(async move {
-        let mut ping_interval = interval(Duration::from_secs(30));
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
         ping_interval.tick().await; // Skip the first immediate tick
         
         loop {
             tokio::select! {
-                // Handle outgoing messages
-                Some(json) = ws_outgoing_rx.recv() => {
-                    if write.send(Message::text(json)).await.is_err() {
+                Some(message) = ws_outgoing_rx.recv() => {
+                    if write.send(Message::Text(message)).await.is_err() {
                         break;
                     }
                 }
-                // Send periodic pings to keep connection alive
                 _ = ping_interval.tick() => {
                     if write.send(Message::Ping(vec![])).await.is_err() {
                         break;
@@ -2631,9 +2653,8 @@ async fn try_connect(
         }
     });
 
-    Ok(())
+    Ok(ws_outgoing_tx)
 }
-
 
 // --- UI Rendering ---
 
