@@ -512,6 +512,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 }
                 VoiceEvent::Disconnected => {
                     app.voice.reset();
+                    app.voice.room_users.clear();
                     app.status_message = "Disconnected from voice.".to_string();
                 }
                 VoiceEvent::ConnectionFailed(reason) => {
@@ -1606,6 +1607,12 @@ async fn handle_room_switcher_screen(app: &mut App<'_>, key: event::KeyEvent) {
             if let Some(room) = app.user_rooms.get(app.switcher_selected_index) {
                 let room_name = room.name.clone();
                 
+                // Leave voice in current room before switching
+                if app.voice.is_connected() {
+                    if let Some(voice_tx) = &app.voice_tx {
+                        let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
+                    }
+                }
                 // Join the new room
                 if let Some(ws_sender) = &app.ws_sender {
                     let join_payload = JoinRoomPayload {
@@ -1690,7 +1697,7 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
             }
         }
         // Force quit
-        "qq" | "qa" | "quit!" => {
+        "qq" | "quit!" => {
             app.should_quit = true;
         }
         // Help command
@@ -1746,6 +1753,12 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                         .cloned();
                     
                     if let Some(room) = target_room {
+                        // Leave voice in current room before switching
+                        if app.voice.is_connected() {
+                            if let Some(voice_tx) = &app.voice_tx {
+                                let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
+                            }
+                        }
                         // Join the new room
                         if let Some(ws_sender) = &app.ws_sender {
                             let join_payload = JoinRoomPayload {
@@ -1925,40 +1938,20 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 app.status_message = "Usage: :dm <username>".to_string();
             }
         }
-        // Voice Chat
+        // Voice Chat - :vc joins voice (no args). :vcl leaves. :m/:um mute.
         "vc" => {
             if app.current_screen == CurrentScreen::InRoom {
                 if let Some(room_id) = &app.room_id {
-                    let subcmd = parts.get(1).map(|s| *s).unwrap_or("");
-                    if let Some(voice_tx) = &app.voice_tx {
-                        match subcmd {
-                            "join" | "" => {
-                                // Check if already connected (using voice state, not server state)
-                                if app.voice.is_connected() {
-                                    app.status_message = "Already in voice chat.".to_string();
-                                } else if matches!(app.voice.status, VoiceConnectionStatus::Connecting) {
-                                    app.status_message = "Already connecting to voice...".to_string();
-                                } else {
-                                    let _ = voice_tx.send(voice::manager::VoiceCommand::Join { room_id: room_id.clone() });
-                                    app.status_message = "Joining voice...".to_string();
-                                }
-                            }
-                            "leave" | "l" => {
-                                // Just send the command - state changes via VoiceEvent::Disconnected
-                                let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
-                                app.status_message = "Leaving voice...".to_string();
-                            }
-                            "mute" | "m" => {
-                                // Just send the command - state changes via VoiceEvent::MuteStateChanged
-                                let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
-                            }
-                            "unmute" | "um" => {
-                                // Just send the command - state changes via VoiceEvent::MuteStateChanged
-                                let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
-                            }
-                            _ => {
-                                app.status_message = "Usage: :vc [join|leave|mute|unmute]".to_string();
-                            }
+                    if parts.get(1).is_some() {
+                        app.status_message = "Usage: :vc  (join). Use :vcl to leave, :m/:um to mute.".to_string();
+                    } else if let Some(voice_tx) = &app.voice_tx {
+                        if app.voice.is_connected() {
+                            app.status_message = "Already in voice chat.".to_string();
+                        } else if matches!(app.voice.status, VoiceConnectionStatus::Connecting) {
+                            app.status_message = "Already connecting to voice...".to_string();
+                        } else {
+                            let _ = voice_tx.send(voice::manager::VoiceCommand::Join { room_id: room_id.clone() });
+                            app.status_message = "Joining voice...".to_string();
                         }
                     } else {
                         app.status_message = "Voice Chat not initialized.".to_string();
@@ -1970,13 +1963,23 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
         }
         // Aliases - just send commands, state changes via events
         "m" | "mute" => {
-            if let Some(voice_tx) = &app.voice_tx {
-                let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
+            if app.voice.is_connected() {
+                if let Some(voice_tx) = &app.voice_tx {
+                    let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
+                    app.status_message = "Muted.".to_string();
+                }
+            } else {
+                app.status_message = "Not in voice.".to_string();
             }
         }
         "um" | "unmute" => {
-            if let Some(voice_tx) = &app.voice_tx {
-                let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
+            if app.voice.is_connected() {
+                if let Some(voice_tx) = &app.voice_tx {
+                    let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
+                    app.status_message = "Unmuted.".to_string();
+                }
+            } else {
+                app.status_message = "Not in voice.".to_string();
             }
         }
         "vcl" => {
@@ -1984,6 +1987,38 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
                 app.status_message = "Leaving voice...".to_string();
             }
+        }
+        // Clear local message history
+        "clear" => {
+            if parts.get(1) == Some(&"history") {
+                app.messages.clear();
+                app.message_scroll_offset = 0;
+                app.status_message = "Message history cleared.".to_string();
+            } else {
+                app.status_message = "Usage: :clear history".to_string();
+            }
+        }
+        // Force reconnect
+        "reconnect" => {
+            app.ws_sender = None;
+            app.conn_rx = None;
+            app.connect_delay_ms = 1000;
+            app.next_connect_time = Some(std::time::Instant::now());
+            if let Some(voice_tx) = &app.voice_tx {
+                let _ = voice_tx.send(voice::manager::VoiceCommand::ConnectionStatusChanged(false));
+            }
+            app.status_message = "Reconnecting...".to_string();
+        }
+        // Status summary
+        "status" => {
+            let conn = if app.ws_sender.is_some() { "connected" } else { "disconnected" };
+            let voice = if app.voice.is_connected() { "in voice" } else { "not in voice" };
+            let room = app.room_display_name.as_deref().unwrap_or("none");
+            app.status_message = format!("WS: {} | Voice: {} | Room: {}", conn, voice, room);
+        }
+        // Version
+        "version" | "ver" => {
+            app.status_message = format!("eurus v{}", env!("CARGO_PKG_VERSION"));
         }
         
         // Unknown command
@@ -2188,6 +2223,13 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::RoomDeleted(payload) => {
             if let Some(current_room_id) = &app.room_id {
                 if current_room_id == &payload.room_id {
+                    // Leave voice before clearing room state
+                    if let Some(voice_tx) = &app.voice_tx {
+                        let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
+                    }
+                    app.voice.reset();
+                    app.voice.room_users.clear();
+
                     // Leave room
                     app.room_id = None;
                     app.room_name = None;
@@ -3544,7 +3586,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("COMMANDS").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from("  :q, :quit, :leave    Quit app or leave room"),
-        Line::from("  :qq, :qa, :quit!     Force quit from anywhere"),
+        Line::from("  :qq, :quit!          Force quit from anywhere"),
         Line::from("  :help, :h            Show this help screen"),
         Line::from("  :users, :u           Show online users in room"),
         Line::from("  :register, :reg      Start registration flow"),
@@ -3556,6 +3598,18 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  :delete              Delete current room (owner only)"),
         Line::from("  :transfer <user>     Transfer ownership (owner only)"),
         Line::from("  :dm <username>       Start a direct message chat"),
+        Line::from(""),
+        Line::from("VOICE").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from("  :vc                  Join voice chat in current room"),
+        Line::from("  :vcl                 Leave voice chat"),
+        Line::from("  :m, :mute            Mute microphone"),
+        Line::from("  :um, :unmute         Unmute microphone"),
+        Line::from(""),
+        Line::from("SESSION").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from("  :clear history       Clear local message buffer"),
+        Line::from("  :reconnect           Force WebSocket reconnect"),
+        Line::from("  :status              Show connection + voice + room state"),
+        Line::from("  :version, :ver       Show client version"),
         Line::from(""),
         Line::from("MAIN MENU").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from("  c                    Create a new room"),

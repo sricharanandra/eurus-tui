@@ -23,6 +23,9 @@ pub struct AudioEngine {
     input_stream: Option<SendStream>,
     /// Output streams keyed by peer_id for proper cleanup on peer disconnect
     output_streams: HashMap<String, SendStream>,
+    /// Senders into each peer's decode task, keyed by peer_id.
+    /// Reused across packets so the cpal output stream is created once per peer.
+    peer_senders: HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
     /// Channel to report audio errors back to VoiceManager
     error_tx: Option<mpsc::UnboundedSender<AudioDeviceError>>,
 }
@@ -92,6 +95,7 @@ impl AudioEngine {
         Self { 
             input_stream: None,
             output_streams: HashMap::new(),
+            peer_senders: HashMap::new(),
             error_tx: None,
         }
     }
@@ -106,23 +110,33 @@ impl AudioEngine {
         // Drop input stream (stops capture)
         self.input_stream.take();
         
-        // Drop all output streams (stops playback)
+        // Drop all output streams (stops playback) and their senders
         self.output_streams.clear();
+        self.peer_senders.clear();
     }
 
     /// Remove the output stream associated with a specific peer.
     /// Called when a peer disconnects or leaves voice to prevent stream accumulation.
     pub fn remove_peer_stream(&mut self, peer_id: &str) {
         self.output_streams.remove(peer_id);
+        self.peer_senders.remove(peer_id);
     }
 
-    /// Start playback for a specific peer, replacing any existing stream for that peer.
-    pub fn start_playback_for_peer(&mut self, peer_id: &str, packet_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Result<()> {
-        // Remove any existing stream for this peer first
-        self.output_streams.remove(peer_id);
-        
+    /// Push a single Opus packet for a peer. Lazily creates the peer's
+    /// decode + playback stream on first packet, then reuses the sender
+    /// for all subsequent packets. This avoids recreating the cpal stream
+    /// every 20ms (which produced silence).
+    pub fn push_peer_packet(&mut self, peer_id: &str, packet: Vec<u8>) -> Result<()> {
+        if let Some(tx) = self.peer_senders.get(peer_id) {
+            let _ = tx.send(packet);
+            return Ok(());
+        }
+
+        let (packet_tx, packet_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let stream = self.build_playback_stream(packet_rx)?;
         self.output_streams.insert(peer_id.to_string(), SendStream(stream));
+        self.peer_senders.insert(peer_id.to_string(), packet_tx.clone());
+        let _ = packet_tx.send(packet);
         Ok(())
     }
 
@@ -230,7 +244,7 @@ impl AudioEngine {
         Ok(stream)
     }
 
-    pub fn start_capture(&mut self, encoded_tx: mpsc::UnboundedSender<Vec<u8>>) -> Result<()> {
+    pub fn start_capture(&mut self, encoded_tx: mpsc::UnboundedSender<(Vec<u8>, bool)>) -> Result<()> {
         let host = cpal::default_host();
         let device = host.default_input_device().ok_or(anyhow!("No input device"))?;
         
@@ -257,6 +271,11 @@ impl AudioEngine {
 
         let stream_config: cpal::StreamConfig = config.clone().into();
         let device_sample_rate = stream_config.sample_rate.0;
+
+        // Guard against double-capture: stop any existing input stream first.
+        if self.input_stream.is_some() {
+            self.input_stream.take();
+        }
 
         // We encode at 48k. Resample input -> 48k.
         let opus_rate = SampleRate::Hz48000;
@@ -290,7 +309,10 @@ impl AudioEngine {
                     match encoder.encode_float(&frame, &mut output) {
                         Ok(len) => {
                             let packet = output[..len].to_vec();
-                            if encoded_tx.send(packet).is_err() {
+                            // VAD-lite: RMS energy threshold
+                            let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+                            let active = rms > 0.01;
+                            if encoded_tx.send((packet, active)).is_err() {
                                 return; // Channel closed
                             }
                         },
