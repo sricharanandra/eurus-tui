@@ -202,6 +202,9 @@ struct App<'a> {
     next_connect_time: Option<std::time::Instant>,
     connect_delay_ms: u64,
     conn_rx: Option<mpsc::UnboundedReceiver<Result<mpsc::UnboundedSender<String>, String>>>,
+    // Incremented per connection attempt. Disconnect signals tagged with an
+    // older generation are ignored so a stale socket can't kill the live one.
+    conn_generation: u64,
     
     // Clipboard & Config
     clipboard: Option<ClipboardManager>,
@@ -277,6 +280,7 @@ impl<'a> Default for App<'a> {
             next_connect_time: None,
             connect_delay_ms: 1000,
             conn_rx: None,
+            conn_generation: 0,
             clipboard,
             config: Config::load(),
             vim_state: VimState::default(),
@@ -474,8 +478,14 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 
         // Handle incoming WebSocket messages without blocking UI
         if let Ok(text) = ws_incoming_rx.try_recv() {
-            // Check for disconnect signal
-            if text == "__DISCONNECT__" {
+            // Check for disconnect signal (tagged with connection generation)
+            let is_disconnect = text.starts_with("__DISCONNECT__");
+            if is_disconnect {
+                let gen: u64 = text.split(':').nth(1).and_then(|g| g.parse().ok()).unwrap_or(app.conn_generation);
+                if gen != app.conn_generation {
+                    // Stale socket from an older connection attempt; ignore.
+                    continue;
+                }
                 app.messages.push(ChatMessage::system("[SYSTEM] Connection lost. Attempting to reconnect...".to_string()));
                 app.ws_sender = None;
                 
@@ -1983,9 +1993,13 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
             }
         }
         "vcl" => {
-            if let Some(voice_tx) = &app.voice_tx {
-                let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
-                app.status_message = "Leaving voice...".to_string();
+            if app.voice.is_connected() {
+                if let Some(voice_tx) = &app.voice_tx {
+                    let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
+                    app.status_message = "Leaving voice...".to_string();
+                }
+            } else {
+                app.status_message = "Not in voice.".to_string();
             }
         }
         // Clear local message history
@@ -2618,6 +2632,8 @@ fn start_background_connection(
     
     app.is_reconnecting = true;
     app.status_message = format!("Connecting to server (Attempt {}/5)...", app.reconnect_attempts + 1);
+    app.conn_generation = app.conn_generation.wrapping_add(1);
+    let conn_generation = app.conn_generation;
 
     let (tx, rx) = mpsc::unbounded_channel();
     app.conn_rx = Some(rx);
@@ -2628,7 +2644,7 @@ fn start_background_connection(
     let voice_tx = app.voice_tx.clone();
 
     tokio::spawn(async move {
-        match try_connect(ws_url, token, incoming_tx, voice_tx).await {
+        match try_connect(ws_url, token, incoming_tx, voice_tx, conn_generation).await {
             Ok(ws_sender) => {
                 let _ = tx.send(Ok(ws_sender));
             }
@@ -2644,6 +2660,7 @@ async fn try_connect(
     token: Option<String>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
     voice_tx: Option<mpsc::UnboundedSender<voice::manager::VoiceCommand>>,
+    conn_generation: u64,
 ) -> Result<mpsc::UnboundedSender<String>, Box<dyn std::error::Error + Send + Sync>> {
     // Append token as query parameter
     if let Some(t) = token {
@@ -2669,6 +2686,7 @@ async fn try_connect(
 
     // Task to listen for incoming messages from the server
     let incoming_tx = ws_incoming_tx.clone();
+    let disconnect_msg = format!("__DISCONNECT__:{}", conn_generation);
     tokio::spawn(async move {
         while let Some(message_result) = read.next().await {
             match message_result {
@@ -2680,12 +2698,12 @@ async fn try_connect(
                     }
                 }
                 Err(_) => {
-                    let _ = incoming_tx.send("__DISCONNECT__".to_string());
+                    let _ = incoming_tx.send(disconnect_msg.clone());
                     break;
                 }
             }
         }
-        let _ = incoming_tx.send("__DISCONNECT__".to_string());
+        let _ = incoming_tx.send(disconnect_msg);
     });
 
     // Task to send outgoing messages to the server

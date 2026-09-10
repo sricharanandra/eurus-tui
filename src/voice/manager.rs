@@ -167,9 +167,9 @@ impl VoiceManager {
 
     async fn handle_join(&self, room_id: String) {
         if self.in_voice.load(Ordering::Relaxed) {
-            let _ = self.event_tx.send(VoiceEvent::ConnectionFailed(
-                "Already in voice".to_string(),
-            ));
+            // Idempotent: already live, re-confirm instead of failing.
+            let _ = self.event_tx.send(VoiceEvent::VoiceJoined);
+            let _ = self.event_tx.send(VoiceEvent::Connected);
             return;
         }
 
@@ -199,7 +199,8 @@ impl VoiceManager {
 
     async fn handle_leave(&self) {
         if !self.in_voice.load(Ordering::Relaxed) {
-            let _ = self.event_tx.send(VoiceEvent::VoiceLeft);
+            // Nothing to leave. Emit no event so we don't wipe the roster
+            // of a room where others are still in voice.
             return;
         }
 
@@ -250,7 +251,9 @@ impl VoiceManager {
                 *state = VoiceState::Disconnected;
             }
             self.reset_voice_state_internal().await;
-            let _ = self.event_tx.send(VoiceEvent::Disconnected);
+            if was_in_voice {
+                let _ = self.event_tx.send(VoiceEvent::Disconnected);
+            }
         }
     }
 
@@ -310,7 +313,19 @@ impl VoiceManager {
         let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel::<(Vec<u8>, bool)>();
         {
             let mut audio = self.audio_engine.lock().await;
-            audio.start_capture(encoded_tx)?;
+            if let Err(e) = audio.start_capture(encoded_tx) {
+                // Back out the server-side join we just sent so we don't
+                // leave a ghost voice session.
+                let leave = ClientMessage::LeaveVoice {
+                    payload: LeaveVoicePayload { room_id: room_id.to_string() },
+                };
+                if let Ok(json) = serde_json::to_string(&leave) {
+                    self.send_ws(&json);
+                }
+                let mut room = self.room_id.lock().await;
+                *room = None;
+                return Err(e);
+            }
         }
 
         self.in_voice.store(true, Ordering::Relaxed);
@@ -432,6 +447,7 @@ impl VoiceManager {
     async fn reset_voice_state_internal(&self) {
         self.seq.store(0, Ordering::Relaxed);
         self.timestamp.store(0, Ordering::Relaxed);
+        self.is_muted.store(false, Ordering::Relaxed);
         let _ = self.event_tx.send(VoiceEvent::TxActivity(false));
         let _ = self.event_tx.send(VoiceEvent::MuteStateChanged(false));
     }

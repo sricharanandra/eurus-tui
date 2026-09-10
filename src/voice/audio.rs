@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamError;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -26,6 +26,9 @@ pub struct AudioEngine {
     /// Senders into each peer's decode task, keyed by peer_id.
     /// Reused across packets so the cpal output stream is created once per peer.
     peer_senders: HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    /// Peers whose playback stream failed to build. Drop their packets
+    /// silently (report once) until reset, avoiding 50 errors/sec.
+    failed_peers: HashSet<String>,
     /// Channel to report audio errors back to VoiceManager
     error_tx: Option<mpsc::UnboundedSender<AudioDeviceError>>,
 }
@@ -96,6 +99,7 @@ impl AudioEngine {
             input_stream: None,
             output_streams: HashMap::new(),
             peer_senders: HashMap::new(),
+            failed_peers: HashSet::new(),
             error_tx: None,
         }
     }
@@ -113,6 +117,7 @@ impl AudioEngine {
         // Drop all output streams (stops playback) and their senders
         self.output_streams.clear();
         self.peer_senders.clear();
+        self.failed_peers.clear();
     }
 
     /// Remove the output stream associated with a specific peer.
@@ -127,13 +132,22 @@ impl AudioEngine {
     /// for all subsequent packets. This avoids recreating the cpal stream
     /// every 20ms (which produced silence).
     pub fn push_peer_packet(&mut self, peer_id: &str, packet: Vec<u8>) -> Result<()> {
+        if self.failed_peers.contains(peer_id) {
+            return Ok(());
+        }
         if let Some(tx) = self.peer_senders.get(peer_id) {
             let _ = tx.send(packet);
             return Ok(());
         }
 
         let (packet_tx, packet_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let stream = self.build_playback_stream(packet_rx)?;
+        let stream = match self.build_playback_stream(packet_rx) {
+            Ok(s) => s,
+            Err(e) => {
+                self.failed_peers.insert(peer_id.to_string());
+                return Err(e);
+            }
+        };
         self.output_streams.insert(peer_id.to_string(), SendStream(stream));
         self.peer_senders.insert(peer_id.to_string(), packet_tx.clone());
         let _ = packet_tx.send(packet);

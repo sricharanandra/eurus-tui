@@ -29,6 +29,9 @@ pub fn log(msg: impl AsRef<str>) {
         return;
     }
     if let Some(path) = &guard.path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
             let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
             let _ = writeln!(f, "[{}] {}", ts, msg.as_ref());
