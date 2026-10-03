@@ -15,7 +15,7 @@ node scripts/voice-playback-review.cjs
 node scripts/voice-receive-review.cjs
 ```
 
-These checks assert the desired behavior and intentionally fail on the reviewed head:
+These checks assert the desired behavior. They fail on the reviewed head and pass on `fix/voice-rejoin`, where they are the regression tests:
 
 | Failure | Observation | Fix |
 |---|---|---|
@@ -33,6 +33,6 @@ Further inspected paths need coverage: ignored voice acknowledgements, queued mi
 
 `tests/voice_review.rs` includes the real voice modules and seeds an active session before exercising the real state transitions. It opens no audio devices. `tests/voice_room_review.rs` includes the real application and calls its command/message handlers without running the terminal loop. Filter with `review::` to avoid unrelated included tests.
 
-The playback script extracts and compiles the actual playback callback. Only its unused device metadata argument is stubbed. The receive script inserts the actual UI receive block into a temporary integration test, supplies virtual 50 ms ticks and real server-message handling, and removes the generated file afterward. Neither script changes application code.
+The playback script extracts and compiles the production output fill code: the callback on the reviewed head, `fill_output` on the fix branch. The receive script inserts the actual UI receive block into a temporary integration test, supplies virtual 50 ms ticks and real server-message handling, and removes the generated file afterward. Neither script changes application code.
 
 The client compiles and produces an ARM64 debug binary on this machine, with existing warnings. Physical microphone/speaker behavior and full end-to-end recovery still require a two-client device test after fixes. This review has not established a native crash cause.
