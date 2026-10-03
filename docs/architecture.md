@@ -154,30 +154,10 @@ Voice runs as a dedicated tokio task separate from the main UI loop:
 ```
 [Main Loop] <--VoiceEvent-- [VoiceManager Task] <--AudioDeviceError-- [AudioEngine]
      │                              │
-     │---VoiceCommand-------------->│
-     │
-     +-- (forward Signal events over WebSocket)
+     │---VoiceCommand-------------->│---mic audio---> WebSocket
 ```
 
-### Command Channel
-
-The main loop sends commands to the VoiceManager:
-
-- `Join(room_id)` — Start voice session
-- `Leave` — End voice session
-- `Mute(bool)` — Toggle microphone
-- `Signal { sender_id, signal_type, data }` — Forward server voice signals
-
-### Event Channel
-
-The VoiceManager sends events back to the main loop:
-
-- `Signal { ... }` — Audio data or control signals to forward to server
-- `Connecting` / `Connected` / `Disconnected` — Connection state changes
-- `ConnectionFailed(reason)` — Error with description
-- `MuteStateChanged(bool)` — Mute toggle confirmation
-- `TxActivity(bool)` — Microphone activity indicator
-- `AudioError(String)` — Audio device errors
+The main loop forwards voice-related server messages (`voice_joined`, `voice_error`, `audio`, room confirmations, connection changes) as commands. The manager owns the session state and sends audio over the socket itself. Events carry state changes back for the UI. See [Voice](voice.md) for the commands, events and session lifecycle.
 
 This separation ensures that audio processing (which involves blocking cpal callbacks) never blocks the UI render loop.
 

@@ -34,14 +34,10 @@ All commands are entered by pressing `:` in any screen. Commands are context-sen
 
 | Command | Aliases | Context | Action |
 |---|---|---|---|
-| `:vc` | — | InRoom | Join voice chat (default subcommand) |
-| `:vc join` | — | InRoom | Join voice chat explicitly |
-| `:vc leave` | `:vc l` | InRoom | Leave voice chat |
-| `:vc mute` | `:vc m` | InRoom | Mute microphone |
-| `:vc unmute` | `:vc um` | InRoom | Unmute microphone |
-| `:m` | `:mute` | Anywhere | Mute microphone |
+| `:vc` | — | InRoom | Join voice chat in the current room (takes no arguments) |
+| `:vcl` | — | Anywhere | Leave voice chat, or cancel a pending join or reconnect |
+| `:m` | `:mute` | Anywhere | Mute microphone (kept across reconnects) |
 | `:um` | `:unmute` | Anywhere | Unmute microphone |
-| `:vcl` | — | Anywhere | Leave voice chat |
 
 ## UI
 
@@ -60,7 +56,6 @@ All commands are entered by pressing `:` in any screen. Commands are context-sen
 Commands are parsed by splitting the input on whitespace:
 
 ```
-:vc join    → parts = ["vc", "join"]
 :rename new-name  → parts = ["rename", "new-name"]
 :dm alice   → parts = ["dm", "alice"]
 ```
@@ -72,7 +67,7 @@ The first part determines the command. Remaining parts are arguments. For comman
 When `:` is pressed, the footer changes to show the current command input in cyan bold:
 
 ```
-:vc join
+:dm alice
 ```
 
 Pressing Enter executes the command. Pressing Esc cancels and returns to the previous screen state.
