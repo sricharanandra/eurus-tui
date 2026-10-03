@@ -1,34 +1,27 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use base64::{Engine as _, engine::general_purpose};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use crate::voice::types::{
-    AudioPayload, ClientMessage, LeaveVoicePayload,
+    AudioPayload, ClientMessage, JoinVoicePayload, LeaveVoicePayload,
 };
 use crate::voice::audio::{AudioEngine, AudioDeviceError};
 use crate::voice::debug::voice_debug;
 
 const TX_THROTTLE_MS: u64 = 200;
 const TX_QUIET_TIMEOUT_MS: u64 = 600;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum VoiceState {
-    Disconnected,
-    Connected,
-    InRoom,
-    InVoice,
-    Streaming,
-}
-
-impl Default for VoiceState {
-    fn default() -> Self {
-        VoiceState::Disconnected
-    }
-}
+/// How long to wait for the server's voice_joined before giving up.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// A mic error sooner than this after capture (re)started ends the session
+/// instead of restarting capture again.
+const CAPTURE_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// Encoded mic packets waiting for the socket; older ones are dropped.
+const ENCODED_QUEUE_LEN: usize = 50;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceConnectionStatus {
@@ -48,6 +41,7 @@ impl Default for VoiceConnectionStatus {
 pub enum VoiceEvent {
     Connecting,
     Connected,
+    /// Transport dropped mid-call; voice resumes when the room is rejoined.
     Disconnected,
     ConnectionFailed(String),
     VoiceJoined,
@@ -66,50 +60,58 @@ pub enum VoiceCommand {
     Mute(bool),
     SetWsSender(mpsc::UnboundedSender<String>),
     ServerAudio(crate::api::ServerAudioPayload),
+    /// Server admitted this connection to voice in room_id.
+    ServerVoiceJoined { room_id: String },
+    /// Server refused or failed a voice join for room_id.
+    ServerVoiceError { room_id: String, message: String },
     ConnectionStatusChanged(bool),
-    RoomJoined,
+    /// Server confirmed the chat room this client is now in.
+    RoomJoined { room_id: String },
 }
 
+/// Where the voice session stands. One value instead of several flags, so
+/// combinations like "not in voice but will rejoin some old room" can't drift
+/// out of sync.
+#[derive(Debug)]
+enum Session {
+    Idle,
+    /// join_voice sent; capture starts once the server confirms.
+    Joining { room_id: String, deadline: tokio::time::Instant },
+    /// Admitted and capturing. mic_task sends to the socket that was live
+    /// when capture started, so it can't leak into a later connection.
+    Live { room_id: String, mic_task: JoinHandle<()>, capture_started: Instant },
+    /// Transport dropped mid-call; rejoin when this room is confirmed again.
+    Suspended { room_id: String },
+}
+
+/// Owns the voice session. Runs as one task fed by VoiceCommand; all state
+/// changes are reported to the UI as VoiceEvent.
 pub struct VoiceManager {
-    state: Arc<Mutex<VoiceState>>,
-    status: Arc<Mutex<VoiceConnectionStatus>>,
-    room_id: Arc<Mutex<Option<String>>>,
     event_tx: mpsc::UnboundedSender<VoiceEvent>,
+    ws_tx: Option<mpsc::UnboundedSender<String>>,
+    connected: bool,
+    /// Shared with the mic task. Survives transport recovery; cleared on explicit leave.
     is_muted: Arc<AtomicBool>,
-    seq: Arc<AtomicU32>,
-    timestamp: Arc<AtomicU64>,
-    audio_engine: Arc<Mutex<AudioEngine>>,
+    audio: AudioEngine,
     audio_error_rx: Option<mpsc::UnboundedReceiver<AudioDeviceError>>,
-    ws_tx: Arc<StdMutex<Option<mpsc::UnboundedSender<String>>>>,
-    in_voice: Arc<AtomicBool>,
-    was_in_voice: Arc<AtomicBool>,
+    session: Session,
 }
 
 impl VoiceManager {
     pub fn new(event_tx: mpsc::UnboundedSender<VoiceEvent>) -> Self {
         let (audio_error_tx, audio_error_rx) = mpsc::unbounded_channel::<AudioDeviceError>();
-        let mut audio_engine = AudioEngine::new();
-        let _ = audio_engine.set_error_channel(audio_error_tx);
+        let mut audio = AudioEngine::new();
+        audio.set_error_channel(audio_error_tx);
 
         Self {
-            state: Arc::new(Mutex::new(VoiceState::Disconnected)),
-            status: Arc::new(Mutex::new(VoiceConnectionStatus::Disconnected)),
-            room_id: Arc::new(Mutex::new(None)),
             event_tx,
+            ws_tx: None,
+            connected: false,
             is_muted: Arc::new(AtomicBool::new(false)),
-            seq: Arc::new(AtomicU32::new(0)),
-            timestamp: Arc::new(AtomicU64::new(0)),
-            audio_engine: Arc::new(Mutex::new(audio_engine)),
+            audio,
             audio_error_rx: Some(audio_error_rx),
-            ws_tx: Arc::new(StdMutex::new(None)),
-            in_voice: Arc::new(AtomicBool::new(false)),
-            was_in_voice: Arc::new(AtomicBool::new(false)),
+            session: Session::Idle,
         }
-    }
-
-    pub fn set_ws_sender(&self, tx: mpsc::UnboundedSender<String>) {
-        let mut ws = self.ws_tx.lock().unwrap();
-        *ws = Some(tx);
     }
 
     pub async fn run(
@@ -119,258 +121,253 @@ impl VoiceManager {
         let mut audio_error_rx = self.audio_error_rx.take();
 
         loop {
+            let join_deadline = match &self.session {
+                Session::Joining { deadline, .. } => Some(*deadline),
+                _ => None,
+            };
+
             tokio::select! {
-                Some(cmd) = command_rx.recv() => {
-                    match cmd {
-                        VoiceCommand::Join { room_id } => {
-                            self.handle_join(room_id).await;
-                        }
-                        VoiceCommand::Leave => {
-                            self.handle_leave().await;
-                        }
-                        VoiceCommand::Mute(muted) => {
-                            self.is_muted.store(muted, Ordering::Relaxed);
-                            let _ = self.event_tx.send(VoiceEvent::MuteStateChanged(muted));
-                        }
-                        VoiceCommand::SetWsSender(sender) => {
-                            self.set_ws_sender(sender);
-                        }
-                        VoiceCommand::ServerAudio(payload) => {
-                            self.handle_server_audio(payload).await;
-                        }
-                        VoiceCommand::ConnectionStatusChanged(connected) => {
-                            self.handle_connection_status(connected).await;
-                        }
-                        VoiceCommand::RoomJoined => {
-                            self.handle_room_joined().await;
-                        }
-                    }
-                }
+                cmd = command_rx.recv() => match cmd {
+                    Some(cmd) => self.handle_command(cmd),
+                    None => break,
+                },
                 Some(err) = async {
-                    if let Some(ref mut rx) = audio_error_rx {
-                        rx.recv().await
-                    } else {
-                        None
+                    match audio_error_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
                     }
                 } => {
-                    let err_msg = match err {
-                        AudioDeviceError::OutputDeviceError(e) => format!("Output error: {}", e),
-                        AudioDeviceError::InputDeviceError(e) => format!("Input error: {}", e),
-                    };
-                    voice_debug!("audio device error: {}", err_msg);
-                    let _ = self.event_tx.send(VoiceEvent::AudioError(err_msg));
+                    self.handle_device_error(err);
                 }
-                else => break,
+                _ = tokio::time::sleep_until(join_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if join_deadline.is_some() => {
+                    self.handle_join_timeout();
+                }
             }
+        }
+
+        self.end_session();
+    }
+
+    fn handle_command(&mut self, cmd: VoiceCommand) {
+        match cmd {
+            VoiceCommand::Join { room_id } => self.handle_join(room_id),
+            VoiceCommand::Leave => self.handle_leave(),
+            VoiceCommand::Mute(muted) => {
+                self.is_muted.store(muted, Ordering::Relaxed);
+                if muted {
+                    self.emit(VoiceEvent::TxActivity(false));
+                }
+                self.emit(VoiceEvent::MuteStateChanged(muted));
+            }
+            VoiceCommand::SetWsSender(sender) => self.ws_tx = Some(sender),
+            VoiceCommand::ServerAudio(payload) => self.handle_server_audio(payload),
+            VoiceCommand::ServerVoiceJoined { room_id } => self.handle_voice_joined(room_id),
+            VoiceCommand::ServerVoiceError { room_id, message } => self.handle_voice_error(room_id, message),
+            VoiceCommand::ConnectionStatusChanged(connected) => self.handle_connection_status(connected),
+            VoiceCommand::RoomJoined { room_id } => self.handle_room_joined(room_id),
         }
     }
 
-    async fn handle_join(&self, room_id: String) {
-        if self.in_voice.load(Ordering::Relaxed) {
-            // Idempotent: already live, re-confirm instead of failing.
-            let _ = self.event_tx.send(VoiceEvent::VoiceJoined);
-            let _ = self.event_tx.send(VoiceEvent::Connected);
-            return;
-        }
-
-        {
-            let state = self.state.lock().await;
-            if *state != VoiceState::Connected && *state != VoiceState::InRoom {
-                let _ = self.event_tx.send(VoiceEvent::ConnectionFailed(
-                    "Not connected to server".to_string(),
-                ));
+    fn handle_join(&mut self, room_id: String) {
+        match &self.session {
+            Session::Live { room_id: current, .. } if *current == room_id => {
+                self.emit(VoiceEvent::VoiceJoined);
+                self.emit(VoiceEvent::Connected);
                 return;
             }
+            Session::Joining { room_id: current, .. } if *current == room_id => {
+                self.emit(VoiceEvent::Connecting);
+                return;
+            }
+            Session::Suspended { room_id: current } if *current == room_id && !self.connected => {
+                self.emit(VoiceEvent::Disconnected);
+                return;
+            }
+            _ => {}
         }
 
+        // Anything else belongs to another room or a dead transport.
+        self.end_session();
+        self.request_join(room_id);
+    }
+
+    /// Ask the server for voice in room_id. Capture waits for voice_joined.
+    fn request_join(&mut self, room_id: String) {
+        if !self.connected {
+            self.emit(VoiceEvent::ConnectionFailed("Not connected to server".to_string()));
+            return;
+        }
         voice_debug!("join voice room_id={}", room_id);
-        let _ = self.event_tx.send(VoiceEvent::Connecting);
-
-        if let Err(e) = self.start_voice_session(&room_id).await {
-            voice_debug!("start_voice_session failed: {}", e);
-            let _ = self.event_tx.send(VoiceEvent::AudioError(format!("Mic error: {}", e)));
-            let _ = self.event_tx.send(VoiceEvent::ConnectionFailed("Failed to start microphone".to_string()));
-            return;
-        }
-
-        let _ = self.event_tx.send(VoiceEvent::VoiceJoined);
-        let _ = self.event_tx.send(VoiceEvent::Connected);
-    }
-
-    async fn handle_leave(&self) {
-        if !self.in_voice.load(Ordering::Relaxed) {
-            // Nothing to leave. Emit no event so we don't wipe the roster
-            // of a room where others are still in voice.
-            return;
-        }
-
-        voice_debug!("leave voice");
-        self.stop_voice_session().await;
-
-        let room_id = {
-            let mut room = self.room_id.lock().await;
-            room.take()
-        };
-
-        if let Some(rid) = room_id {
-            let msg = ClientMessage::LeaveVoice {
-                payload: LeaveVoicePayload { room_id: rid },
-            };
-            if let Ok(json) = serde_json::to_string(&msg) {
-                self.send_ws(&json);
-            }
-        }
-
-        self.reset_voice_state().await;
-        let _ = self.event_tx.send(VoiceEvent::VoiceLeft);
-    }
-
-    async fn handle_connection_status(&self, connected: bool) {
-        if connected {
-            voice_debug!("ws connected");
-            let mut state = self.state.lock().await;
-            if *state == VoiceState::Disconnected {
-                *state = VoiceState::Connected;
-            }
-            // Voice rejoin happens on RoomJoined, not here, to ensure the
-            // chat room is re-joined before we send join_voice.
-        } else {
-            voice_debug!("ws disconnected");
-            let was_in_voice = self.in_voice.load(Ordering::Relaxed);
-            {
-                let mut audio = self.audio_engine.lock().await;
-                audio.reset();
-            }
-            self.in_voice.store(false, Ordering::Relaxed);
-            if was_in_voice {
-                self.was_in_voice.store(true, Ordering::Relaxed);
-                voice_debug!("marked was_in_voice for reconnect rejoin");
-            }
-            {
-                let mut state = self.state.lock().await;
-                *state = VoiceState::Disconnected;
-            }
-            self.reset_voice_state_internal().await;
-            if was_in_voice {
-                let _ = self.event_tx.send(VoiceEvent::Disconnected);
-            }
-        }
-    }
-
-    async fn handle_room_joined(&self) {
-        let should_rejoin = self.was_in_voice.load(Ordering::Relaxed)
-            && !self.in_voice.load(Ordering::Relaxed);
-
-        {
-            let mut state = self.state.lock().await;
-            if *state == VoiceState::Connected || *state == VoiceState::Disconnected {
-                *state = VoiceState::InRoom;
-            }
-        }
-
-        if should_rejoin {
-            let room_id = {
-                let room = self.room_id.lock().await;
-                room.clone()
-            };
-            if let Some(rid) = room_id {
-                voice_debug!("auto-rejoining voice after reconnect room_id={}", rid);
-                self.was_in_voice.store(false, Ordering::Relaxed);
-                if let Err(e) = self.start_voice_session(&rid).await {
-                    voice_debug!("auto-rejoin failed: {}", e);
-                    let _ = self.event_tx.send(VoiceEvent::AudioError(format!("Mic error: {}", e)));
-                } else {
-                    let _ = self.event_tx.send(VoiceEvent::VoiceJoined);
-                    let _ = self.event_tx.send(VoiceEvent::Connected);
-                }
-            } else {
-                self.was_in_voice.store(false, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Send join_voice, then start mic capture + spawn the mic→ws sender task.
-    /// Caller is responsible for guarding against double-join.
-    async fn start_voice_session(&self, room_id: &str) -> Result<()> {
-        self.seq.store(0, Ordering::Relaxed);
-        self.timestamp.store(0, Ordering::Relaxed);
-
-        {
-            let mut room = self.room_id.lock().await;
-            *room = Some(room_id.to_string());
-        }
-
-        // Join on the server FIRST so early mic packets aren't dropped as strays.
         let msg = ClientMessage::JoinVoice {
-            payload: crate::voice::types::JoinVoicePayload {
-                room_id: room_id.to_string(),
-            },
+            payload: JoinVoicePayload { room_id: room_id.clone() },
         };
-        if let Ok(json) = serde_json::to_string(&msg) {
-            self.send_ws(&json);
+        if let Err(e) = self.send(&msg) {
+            self.emit(VoiceEvent::ConnectionFailed(e.to_string()));
+            return;
+        }
+        self.session = Session::Joining {
+            room_id,
+            deadline: tokio::time::Instant::now() + JOIN_TIMEOUT,
+        };
+        self.emit(VoiceEvent::Connecting);
+    }
+
+    fn handle_voice_joined(&mut self, room_id: String) {
+        // Ignore confirmations for joins that were since cancelled or replaced.
+        match &self.session {
+            Session::Joining { room_id: pending, .. } if *pending == room_id => {}
+            _ => return,
         }
 
-        let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel::<(Vec<u8>, bool)>();
-        {
-            let mut audio = self.audio_engine.lock().await;
-            if let Err(e) = audio.start_capture(encoded_tx) {
-                // Back out the server-side join we just sent so we don't
-                // leave a ghost voice session.
-                let leave = ClientMessage::LeaveVoice {
-                    payload: LeaveVoicePayload { room_id: room_id.to_string() },
-                };
-                if let Ok(json) = serde_json::to_string(&leave) {
-                    self.send_ws(&json);
-                }
-                let mut room = self.room_id.lock().await;
-                *room = None;
-                return Err(e);
+        match self.start_capture(&room_id) {
+            Ok(mic_task) => {
+                self.session = Session::Live { room_id, mic_task, capture_started: Instant::now() };
+                self.emit(VoiceEvent::VoiceJoined);
+                self.emit(VoiceEvent::Connected);
+            }
+            Err(e) => {
+                voice_debug!("start_capture failed: {}", e);
+                // Back out the server-side session so we don't leave a ghost.
+                let _ = self.send(&ClientMessage::LeaveVoice {
+                    payload: LeaveVoicePayload { room_id },
+                });
+                self.session = Session::Idle;
+                self.emit(VoiceEvent::AudioError(format!("Mic error: {}", e)));
+                self.emit(VoiceEvent::ConnectionFailed("Failed to start microphone".to_string()));
             }
         }
+    }
 
-        self.in_voice.store(true, Ordering::Relaxed);
-        self.was_in_voice.store(true, Ordering::Relaxed);
+    fn handle_voice_error(&mut self, room_id: String, message: String) {
+        if matches!(&self.session, Session::Joining { room_id: pending, .. } if *pending == room_id) {
+            voice_debug!("voice join rejected room_id={}: {}", room_id, message);
+            self.session = Session::Idle;
+            self.emit(VoiceEvent::ConnectionFailed(message));
+        }
+    }
 
-        let ws_tx = self.ws_tx.clone();
+    fn handle_join_timeout(&mut self) {
+        if let Session::Joining { room_id, .. } = std::mem::replace(&mut self.session, Session::Idle) {
+            voice_debug!("voice join timed out room_id={}", room_id);
+            // In case the server admits us after all.
+            let _ = self.send(&ClientMessage::LeaveVoice {
+                payload: LeaveVoicePayload { room_id },
+            });
+            self.emit(VoiceEvent::ConnectionFailed("Server did not confirm voice join".to_string()));
+        }
+    }
+
+    /// Explicit leave: ends any session and cancels pending rejoin, even
+    /// while disconnected. A no-op when idle so callers can send it freely.
+    fn handle_leave(&mut self) {
+        if matches!(self.session, Session::Idle) {
+            return;
+        }
+        voice_debug!("leave voice");
+        self.end_session();
+        self.is_muted.store(false, Ordering::Relaxed);
+        self.emit(VoiceEvent::TxActivity(false));
+        self.emit(VoiceEvent::MuteStateChanged(false));
+        self.emit(VoiceEvent::VoiceLeft);
+    }
+
+    /// Stop capture/playback and tell the server, without emitting UI events.
+    fn end_session(&mut self) {
+        match std::mem::replace(&mut self.session, Session::Idle) {
+            Session::Live { room_id, mic_task, .. } => {
+                mic_task.abort();
+                self.audio.reset();
+                let _ = self.send(&ClientMessage::LeaveVoice {
+                    payload: LeaveVoicePayload { room_id },
+                });
+            }
+            Session::Joining { room_id, .. } => {
+                let _ = self.send(&ClientMessage::LeaveVoice {
+                    payload: LeaveVoicePayload { room_id },
+                });
+            }
+            Session::Suspended { .. } | Session::Idle => {}
+        }
+    }
+
+    fn handle_connection_status(&mut self, connected: bool) {
+        self.connected = connected;
+        if connected {
+            // Voice rejoin happens on RoomJoined, once the chat room is back.
+            voice_debug!("ws connected");
+            return;
+        }
+
+        voice_debug!("ws disconnected");
+        let room_id = match std::mem::replace(&mut self.session, Session::Idle) {
+            Session::Live { room_id, mic_task, .. } => {
+                mic_task.abort();
+                self.audio.reset();
+                room_id
+            }
+            Session::Joining { room_id, .. } | Session::Suspended { room_id } => room_id,
+            Session::Idle => return,
+        };
+        voice_debug!("suspended voice for reconnect room_id={}", room_id);
+        self.session = Session::Suspended { room_id };
+        self.emit(VoiceEvent::TxActivity(false));
+        self.emit(VoiceEvent::Disconnected);
+    }
+
+    /// Reconcile voice with the confirmed chat room: resume a suspended call
+    /// in the same room, or end voice that belongs to a room we've left.
+    fn handle_room_joined(&mut self, room_id: String) {
+        match &self.session {
+            Session::Idle => {}
+            Session::Suspended { room_id: r } if *r == room_id => {
+                voice_debug!("auto-rejoining voice after reconnect room_id={}", room_id);
+                self.session = Session::Idle;
+                self.request_join(room_id);
+            }
+            Session::Live { room_id: r, .. } | Session::Joining { room_id: r, .. } if *r == room_id => {}
+            _ => self.handle_leave(),
+        }
+    }
+
+    /// Start mic capture and the task that forwards encoded audio to the socket.
+    fn start_capture(&mut self, room_id: &str) -> Result<JoinHandle<()>> {
+        let ws = self.ws_tx.clone().ok_or_else(|| anyhow!("Not connected to server"))?;
+        let (encoded_tx, mut encoded_rx) = mpsc::channel::<(Vec<u8>, bool)>(ENCODED_QUEUE_LEN);
+        self.audio.start_capture(encoded_tx)?;
+
         let event_tx = self.event_tx.clone();
-        let seq = self.seq.clone();
-        let timestamp = self.timestamp.clone();
         let is_muted = self.is_muted.clone();
-        let room_id_owned = room_id.to_string();
+        let room_id = room_id.to_string();
 
-        tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
+            // Per-task counters: a new session never continues an old one's sequence.
+            let mut seq: u32 = 0;
             let mut last_tx_emit: Option<Instant> = None;
             let mut last_active = false;
             let mut quiet_since: Option<Instant> = None;
 
-            voice_debug!("mic task started room_id={}", room_id_owned);
+            voice_debug!("mic task started room_id={}", room_id);
 
             while let Some((packet, active)) = encoded_rx.recv().await {
                 if is_muted.load(Ordering::Relaxed) {
                     continue;
                 }
 
-                let ws_opt = ws_tx.lock().unwrap().clone();
-                if let Some(ws) = ws_opt {
-                    let current_seq = seq.fetch_add(1, Ordering::Relaxed);
-                    let current_ts = timestamp.fetch_add(20, Ordering::Relaxed);
-
-                    let payload = AudioPayload {
-                        room_id: room_id_owned.clone(),
-                        seq: current_seq,
-                        timestamp: current_ts,
+                let msg = ClientMessage::Audio {
+                    payload: AudioPayload {
+                        room_id: room_id.clone(),
+                        seq,
+                        timestamp: seq as u64 * 20,
                         data: general_purpose::STANDARD.encode(&packet),
-                    };
-
-                    let msg = ClientMessage::Audio { payload };
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        if ws.send(json).is_err() {
-                            voice_debug!("mic task: ws send failed, exiting");
-                            break;
-                        }
+                    },
+                };
+                seq = seq.wrapping_add(1);
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    if ws.send(json).is_err() {
+                        voice_debug!("mic task: ws send failed, exiting");
+                        break;
                     }
-                } else {
-                    voice_debug!("mic task: no ws sender, dropping packet");
                 }
 
                 // TxActivity with throttle and quiet-timeout
@@ -386,97 +383,89 @@ impl VoiceManager {
                         quiet_since = None;
                     }
                 } else if last_active {
-                    if quiet_since.is_none() {
-                        quiet_since = Some(now);
-                    }
-                    if let Some(q) = quiet_since {
-                        if now.duration_since(q) > Duration::from_millis(TX_QUIET_TIMEOUT_MS) {
-                            let _ = event_tx.send(VoiceEvent::TxActivity(false));
-                            last_active = false;
-                            last_tx_emit = None;
-                        }
+                    let since = *quiet_since.get_or_insert(now);
+                    if now.duration_since(since) > Duration::from_millis(TX_QUIET_TIMEOUT_MS) {
+                        let _ = event_tx.send(VoiceEvent::TxActivity(false));
+                        last_active = false;
+                        last_tx_emit = None;
                     }
                 }
             }
 
-            voice_debug!("mic task ended room_id={}", room_id_owned);
+            voice_debug!("mic task ended room_id={}", room_id);
             let _ = event_tx.send(VoiceEvent::TxActivity(false));
-        });
-
-        {
-            let mut state = self.state.lock().await;
-            *state = VoiceState::Streaming;
-        }
-
-        Ok(())
+        }))
     }
 
-    /// Stop mic capture, drop all audio streams, clear in_voice flag.
-    async fn stop_voice_session(&self) {
-        {
-            let mut audio = self.audio_engine.lock().await;
-            audio.reset();
-        }
-        self.in_voice.store(false, Ordering::Relaxed);
-        self.was_in_voice.store(false, Ordering::Relaxed);
-    }
-
-    async fn handle_server_audio(&self, payload: crate::api::ServerAudioPayload) {
-        // Drop packets when not in voice - covers in-flight packets after
-        // leaving and server-side races during reconnect.
-        if !self.in_voice.load(Ordering::Relaxed) {
-            return;
+    fn handle_server_audio(&mut self, payload: crate::api::ServerAudioPayload) {
+        // Only play audio for the live session's room. Covers in-flight
+        // packets after leaving, switching rooms, or reconnecting.
+        match &self.session {
+            Session::Live { room_id, .. } if *room_id == payload.room_id => {}
+            _ => return,
         }
 
         let audio_data = match general_purpose::STANDARD.decode(&payload.payload) {
             Ok(d) => d,
             Err(e) => {
                 voice_debug!("audio decode error from {}: {}", payload.user_id, e);
-                let _ = self.event_tx.send(VoiceEvent::AudioError(format!("Decode error: {}", e)));
+                self.emit(VoiceEvent::AudioError(format!("Decode error: {}", e)));
                 return;
             }
         };
 
-        let mut engine = self.audio_engine.lock().await;
-        if let Err(e) = engine.push_peer_packet(&payload.user_id, audio_data) {
+        if let Err(e) = self.audio.push_peer_packet(&payload.user_id, audio_data) {
             voice_debug!("playback error for {}: {}", payload.user_id, e);
-            let _ = self.event_tx.send(VoiceEvent::AudioError(format!("Playback error: {}", e)));
+            self.emit(VoiceEvent::AudioError(format!("Playback error: {}", e)));
         }
     }
 
-    async fn reset_voice_state_internal(&self) {
-        self.seq.store(0, Ordering::Relaxed);
-        self.timestamp.store(0, Ordering::Relaxed);
-        self.is_muted.store(false, Ordering::Relaxed);
-        let _ = self.event_tx.send(VoiceEvent::TxActivity(false));
-        let _ = self.event_tx.send(VoiceEvent::MuteStateChanged(false));
-    }
-
-    async fn reset_voice_state(&self) {
-        {
-            let mut state = self.state.lock().await;
-            *state = VoiceState::InRoom;
+    fn handle_device_error(&mut self, err: AudioDeviceError) {
+        match err {
+            AudioDeviceError::OutputDeviceError(e) => {
+                voice_debug!("output device error: {}", e);
+                // Streams rebuild on the next packet, retrying a missing device.
+                self.audio.drop_playback();
+                self.emit(VoiceEvent::AudioError(format!("Output error: {}", e)));
+            }
+            AudioDeviceError::InputDeviceError(e) => {
+                voice_debug!("input device error: {}", e);
+                self.emit(VoiceEvent::AudioError(format!("Input error: {}", e)));
+                let room_id = match &self.session {
+                    Session::Live { room_id, capture_started, .. }
+                        if capture_started.elapsed() >= CAPTURE_RESTART_MIN_INTERVAL => room_id.clone(),
+                    Session::Live { .. } => return self.fail_session("Microphone keeps failing"),
+                    _ => return,
+                };
+                match self.start_capture(&room_id) {
+                    Ok(mic_task) => {
+                        let old = std::mem::replace(
+                            &mut self.session,
+                            Session::Live { room_id, mic_task, capture_started: Instant::now() },
+                        );
+                        if let Session::Live { mic_task, .. } = old {
+                            mic_task.abort();
+                        }
+                    }
+                    Err(e) => self.fail_session(&format!("Microphone failed: {}", e)),
+                }
+            }
         }
-        self.reset_voice_state_internal().await;
     }
 
-    fn send_ws(&self, json: &str) {
-        let ws_opt = self.ws_tx.lock().unwrap().clone();
-        if let Some(ws) = ws_opt {
-            let _ = ws.send(json.to_string());
-        }
+    /// End a session that can't continue and say why.
+    fn fail_session(&mut self, reason: &str) {
+        self.handle_leave();
+        self.emit(VoiceEvent::ConnectionFailed(reason.to_string()));
     }
 
-    pub async fn get_state(&self) -> VoiceState {
-        self.state.lock().await.clone()
+    fn send(&self, msg: &ClientMessage) -> Result<()> {
+        let ws = self.ws_tx.as_ref().ok_or_else(|| anyhow!("Not connected to server"))?;
+        let json = serde_json::to_string(msg)?;
+        ws.send(json).map_err(|_| anyhow!("Connection closed"))
     }
 
-    pub async fn get_status(&self) -> VoiceConnectionStatus {
-        self.status.lock().await.clone()
-    }
-
-    pub async fn set_status(&self, status: VoiceConnectionStatus) {
-        let mut current = self.status.lock().await;
-        *current = status;
+    fn emit(&self, event: VoiceEvent) {
+        let _ = self.event_tx.send(event);
     }
 }

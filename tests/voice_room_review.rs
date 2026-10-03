@@ -23,13 +23,14 @@ mod review {
                 "messages":[], "onlineUsers":[]}
         })).expect("valid server room confirmation");
         handle_server_message(&mut app, joined);
-        let mut left_voice = false;
+        let mut confirmed = false;
         while let Ok(command) = voice_rx.try_recv() {
-            if matches!(command, voice::manager::VoiceCommand::Leave) {
-                left_voice = true;
+            if let voice::manager::VoiceCommand::RoomJoined { room_id } = command {
+                confirmed = room_id == "new-room";
             }
         }
-        assert!(left_voice, "{command} changed rooms without ending old voice capture");
+        // The voice manager ends voice in old-room when told about the new room
+        assert!(confirmed, "{command} changed rooms without telling voice which room it is now in");
     }
 
     #[tokio::test]

@@ -24,7 +24,8 @@ fn logger() -> &'static Mutex<DebugLogger> {
 }
 
 pub fn log(msg: impl AsRef<str>) {
-    let guard = logger().lock().unwrap();
+    // A panic mid-write only risks a torn log line, so recover from poisoning
+    let guard = logger().lock().unwrap_or_else(|e| e.into_inner());
     if !guard.enabled {
         return;
     }

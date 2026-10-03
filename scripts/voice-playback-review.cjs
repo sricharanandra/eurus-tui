@@ -1,5 +1,5 @@
-// Compile and run the production playback callback without opening an audio device.
-// The callback is extracted verbatim; only its unused CPAL metadata type is stubbed.
+// Compile and run the production playback fill function without opening an audio device.
+// The function is extracted verbatim from audio.rs.
 const assert = require('node:assert/strict');
 const { readFileSync, writeFileSync, mkdtempSync } = require('node:fs');
 const { tmpdir, homedir } = require('node:os');
@@ -8,18 +8,19 @@ const { spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 
 const source = readFileSync(join(__dirname, '../src/voice/audio.rs'), 'utf8');
-const start = source.indexOf('move |data: &mut [f32], _: &_|');
-const end = source.indexOf('\n            err_fn,', start);
-assert.ok(start >= 0 && end > start, 'production output callback must be present');
-const callback = source.slice(start, end).trim().replace(/,$/, '').replace('_: &_|', '_: &()|');
+const start = source.indexOf('fn fill_output(');
+const end = source.indexOf('\n}\n', start) + 2;
+assert.ok(start >= 0 && end > start, 'production fill_output must be present');
+const fillOutput = source.slice(start, end);
 const fixture = `
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::collections::VecDeque;
 
+${fillOutput}
+
 fn play(mono: &[f32], output: &mut [f32]) {
-    let shared_buffer = Arc::new(Mutex::new(VecDeque::from(mono.to_vec())));
-    let callback = ${callback};
-    callback(output, &());
+    let channels = if output.len() > mono.len() { output.len() / mono.len() } else { 1 };
+    fill_output(&Mutex::new(VecDeque::from(mono.to_vec())), output, channels);
 }
 
 #[test]

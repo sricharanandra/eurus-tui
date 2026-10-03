@@ -140,11 +140,16 @@ impl VoiceState {
     pub fn is_connected(&self) -> bool {
         matches!(self.status, VoiceConnectionStatus::Connected)
     }
+
+    /// Joined, joining, or waiting to rejoin after a reconnect
+    pub fn in_session(&self) -> bool {
+        !matches!(self.status, VoiceConnectionStatus::Disconnected)
+    }
     
-    /// Reset all state (called on disconnect)
+    /// Reset session state. Mute is owned by the voice manager and only
+    /// changes through MuteStateChanged.
     pub fn reset(&mut self) {
         self.status = VoiceConnectionStatus::Disconnected;
-        self.is_muted = false;
         self.is_transmitting = false;
         self.tx_last_time = None;
         self.connected_peers.clear();
@@ -327,6 +332,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Upper bound on WebSocket messages handled per UI loop iteration.
+const MAX_INCOMING_PER_TICK: usize = 256;
+
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> io::Result<()> {
     let (ws_incoming_tx, mut ws_incoming_rx) = mpsc::unbounded_channel::<String>();
 
@@ -417,21 +425,21 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         let _ = voice_tx.send(voice::manager::VoiceCommand::ConnectionStatusChanged(true));
                     }
                     
-                    if app.current_screen == CurrentScreen::InRoom {
-                        if let Some(room_id) = app.room_id.clone() {
-                            let join_payload = JoinRoomPayload {
-                                room_id: Some(&room_id),
-                                room_name: None,
-                            };
-                            let join_msg = ClientMessage {
-                                message_type: "joinRoom",
-                                payload: join_payload,
-                            };
-                            if let Ok(json) = serde_json::to_string(&join_msg) {
-                                let _ = ws_sender.send(json);
-                            }
-                            app.messages.push(ChatMessage::system("[SYSTEM] Reconnected successfully!".to_string()));
+                    // Restore the room we were in, whichever screen is showing
+                    // (help, room switcher). Voice resumes on the RoomJoined reply.
+                    if let Some(room_id) = app.room_id.clone() {
+                        let join_payload = JoinRoomPayload {
+                            room_id: Some(&room_id),
+                            room_name: None,
+                        };
+                        let join_msg = ClientMessage {
+                            message_type: "joinRoom",
+                            payload: join_payload,
+                        };
+                        if let Ok(json) = serde_json::to_string(&join_msg) {
+                            let _ = ws_sender.send(json);
                         }
+                        app.messages.push(ChatMessage::system("[SYSTEM] Reconnected successfully!".to_string()));
                     } else {
                         app.status_message = "Connected! Create or Join a secure room.".to_string();
                     }
@@ -476,8 +484,11 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             }
         }
 
-        // Handle incoming WebSocket messages without blocking UI
-        if let Ok(text) = ws_incoming_rx.try_recv() {
+        // Handle incoming WebSocket messages without blocking UI. Drain what's
+        // queued (voice alone is 50 msgs/s) but cap the batch so a flood can't
+        // starve keyboard input.
+        for _ in 0..MAX_INCOMING_PER_TICK {
+            let Ok(text) = ws_incoming_rx.try_recv() else { break };
             // Check for disconnect signal (tagged with connection generation)
             let is_disconnect = text.starts_with("__DISCONNECT__");
             if is_disconnect {
@@ -516,14 +527,15 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 }
                 VoiceEvent::Connected => {
                     app.voice.status = VoiceConnectionStatus::Connected;
-                    app.voice.is_muted = false;
                     app.voice.is_transmitting = false;
                     app.status_message = "Connected to voice.".to_string();
                 }
                 VoiceEvent::Disconnected => {
-                    app.voice.reset();
+                    // Transport lost; the manager rejoins once the room is back
+                    app.voice.status = VoiceConnectionStatus::Reconnecting;
+                    app.voice.is_transmitting = false;
                     app.voice.room_users.clear();
-                    app.status_message = "Disconnected from voice.".to_string();
+                    app.status_message = "Voice reconnecting...".to_string();
                 }
                 VoiceEvent::ConnectionFailed(reason) => {
                     app.voice.reset();
@@ -534,8 +546,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     app.status_message = "Joined voice chat.".to_string();
                 }
                 VoiceEvent::VoiceLeft => {
+                    // Roster comes from the server's voiceState, which may
+                    // already describe the room we just switched to.
                     app.voice.status = VoiceConnectionStatus::Disconnected;
-                    app.voice.room_users.clear();
                     app.status_message = "Left voice chat.".to_string();
                 }
                 VoiceEvent::VoiceStateChanged(users) => {
@@ -1616,14 +1629,8 @@ async fn handle_room_switcher_screen(app: &mut App<'_>, key: event::KeyEvent) {
             // Switch to selected room
             if let Some(room) = app.user_rooms.get(app.switcher_selected_index) {
                 let room_name = room.name.clone();
-                
-                // Leave voice in current room before switching
-                if app.voice.is_connected() {
-                    if let Some(voice_tx) = &app.voice_tx {
-                        let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
-                    }
-                }
-                // Join the new room
+
+                // Join the new room. Voice follows on the server's RoomJoined.
                 if let Some(ws_sender) = &app.ws_sender {
                     let join_payload = JoinRoomPayload {
                         room_id: None,
@@ -1763,13 +1770,7 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                         .cloned();
                     
                     if let Some(room) = target_room {
-                        // Leave voice in current room before switching
-                        if app.voice.is_connected() {
-                            if let Some(voice_tx) = &app.voice_tx {
-                                let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
-                            }
-                        }
-                        // Join the new room
+                        // Join the new room. Voice follows on the server's RoomJoined.
                         if let Some(ws_sender) = &app.ws_sender {
                             let join_payload = JoinRoomPayload {
                                 room_id: None,
@@ -1959,6 +1960,8 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                             app.status_message = "Already in voice chat.".to_string();
                         } else if matches!(app.voice.status, VoiceConnectionStatus::Connecting) {
                             app.status_message = "Already connecting to voice...".to_string();
+                        } else if matches!(app.voice.status, VoiceConnectionStatus::Reconnecting) {
+                            app.status_message = "Voice resumes after reconnect. :vcl to cancel.".to_string();
                         } else {
                             let _ = voice_tx.send(voice::manager::VoiceCommand::Join { room_id: room_id.clone() });
                             app.status_message = "Joining voice...".to_string();
@@ -1973,7 +1976,7 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
         }
         // Aliases - just send commands, state changes via events
         "m" | "mute" => {
-            if app.voice.is_connected() {
+            if app.voice.in_session() {
                 if let Some(voice_tx) = &app.voice_tx {
                     let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
                     app.status_message = "Muted.".to_string();
@@ -1983,7 +1986,7 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
             }
         }
         "um" | "unmute" => {
-            if app.voice.is_connected() {
+            if app.voice.in_session() {
                 if let Some(voice_tx) = &app.voice_tx {
                     let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
                     app.status_message = "Unmuted.".to_string();
@@ -1993,7 +1996,8 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
             }
         }
         "vcl" => {
-            if app.voice.is_connected() {
+            // Also cancels a pending join or post-reconnect rejoin
+            if app.voice.in_session() {
                 if let Some(voice_tx) = &app.voice_tx {
                     let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
                     app.status_message = "Leaving voice...".to_string();
@@ -2117,7 +2121,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             app.status_message = format!("Joined room: {}", payload.display_name);
             
             if let Some(voice_tx) = &app.voice_tx {
-                let _ = voice_tx.send(voice::manager::VoiceCommand::RoomJoined);
+                let _ = voice_tx.send(voice::manager::VoiceCommand::RoomJoined {
+                    room_id: payload.room_id.clone(),
+                });
             }
             
             // Force switch to InRoom screen
@@ -2268,8 +2274,20 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 app.voice.room_users = payload.active_users;
             }
         }
-        ServerMessage::VoiceJoined(_) => {}
+        ServerMessage::VoiceJoined(payload) => {
+            if let Some(voice_tx) = &app.voice_tx {
+                let _ = voice_tx.send(voice::manager::VoiceCommand::ServerVoiceJoined { room_id: payload.room_id });
+            }
+        }
         ServerMessage::VoiceLeft(_) => {}
+        ServerMessage::VoiceError(payload) => {
+            if let Some(voice_tx) = &app.voice_tx {
+                let _ = voice_tx.send(voice::manager::VoiceCommand::ServerVoiceError {
+                    room_id: payload.room_id,
+                    message: payload.message,
+                });
+            }
+        }
         ServerMessage::Audio(payload) => {
             if let Some(voice_tx) = &app.voice_tx {
                 let _ = voice_tx.send(voice::manager::VoiceCommand::ServerAudio(payload.clone()));
@@ -2655,6 +2673,9 @@ fn start_background_connection(
     });
 }
 
+/// Outgoing backlog (~1s of mic audio) beyond which audio frames are dropped.
+const MAX_QUEUED_OUTGOING: usize = 50;
+
 async fn try_connect(
     mut ws_url: String,
     token: Option<String>,
@@ -2713,7 +2734,17 @@ async fn try_connect(
         
         loop {
             tokio::select! {
-                Some(message) = ws_outgoing_rx.recv() => {
+                message = ws_outgoing_rx.recv() => {
+                    let Some(message) = message else {
+                        // Every sender dropped: this connection was replaced
+                        let _ = write.close().await;
+                        break;
+                    };
+                    // On a slow link, drop mic audio rather than queue it;
+                    // control messages always go out.
+                    if ws_outgoing_rx.len() > MAX_QUEUED_OUTGOING && message.starts_with(r#"{"type":"audio""#) {
+                        continue;
+                    }
                     if write.send(Message::Text(message)).await.is_err() {
                         break;
                     }

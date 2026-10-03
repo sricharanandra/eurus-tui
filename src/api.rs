@@ -106,6 +106,13 @@ pub struct VoiceLeftPayload {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VoiceErrorPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ServerAudioPayload {
     #[serde(rename = "roomId")]
     pub room_id: String,
@@ -307,7 +314,12 @@ pub enum ServerMessage {
     RoomDeleted(RoomDeletedPayload),
     OwnershipTransferred(OwnershipTransferredPayload),
     VoiceState(VoiceStatePayload),
+    // The server's voice acks are snake_case, unlike the rest of the protocol
+    #[serde(rename = "voice_joined")]
     VoiceJoined(VoiceJoinedPayload),
+    #[serde(rename = "voice_left")]
     VoiceLeft(VoiceLeftPayload),
+    #[serde(rename = "voice_error")]
+    VoiceError(VoiceErrorPayload),
     Audio(ServerAudioPayload),
 }
