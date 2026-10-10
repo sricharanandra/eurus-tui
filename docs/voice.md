@@ -5,89 +5,59 @@ The Eurus TUI voice system captures microphone audio, encodes it to Opus, sends 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        VoiceManager Task                             │
-│                                                                      │
-│  ┌─────────────┐    ┌─────────────────────────────────────────────┐ │
-│  │  Commands   │    │              VoiceManager                    │ │
-│  │  (from main)│───>│  - join_voice / leave_voice / mute / signal │ │
-│  │             │    │  - is_joined / is_muted state               │ │
-│  └─────────────┘    └──────────┬──────────────────┬────────────────┘ │
-│                                │                  │                   │
-│                    ┌───────────▼──────┐  ┌────────▼───────────────┐  │
-│                    │   AudioEngine    │  │   playback_tx channel  │  │
-│                    │   (audio.rs)     │  │   (for incoming audio) │  │
-│                    └──────────────────┘  └────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
-         │                                        │
-         │  VoiceEvent::Signal { audio }          │  VoiceEvent::Signal { audio }
-         ▼                                        ▼
-┌────────────────────┐                  ┌────────────────────────────┐
-│  Main Loop         │                  │  AudioEngine               │
-│  (main.rs)         │                  │  (voice/audio.rs)          │
-│                    │                  │                            │
-│  Forwards Signal   │                  │  decode → resample → cpal  │
-│  events over       │                  │  playback                  │
-│  WebSocket         │                  │                            │
-└────────────────────┘                  └────────────────────────────┘
+main loop (main.rs)                      VoiceManager task (voice/manager.rs)
+  server messages ── VoiceCommand ──────>  session state machine
+  UI state        <── VoiceEvent ────────  AudioEngine (voice/audio.rs)
+                                           mic task ── audio frames ──> WebSocket
 ```
+
+The main loop drains incoming WebSocket messages every tick (capped per tick so input stays responsive) and forwards voice traffic to the manager. The manager owns all voice state; the UI only mirrors it from events.
 
 ## VoiceManager (`voice/manager.rs`)
 
-The VoiceManager runs as a dedicated tokio task spawned during application initialization. It communicates with the main loop through two unbounded channels:
+### Session states
 
-### Commands (Main Loop → VoiceManager)
+| State | Meaning |
+|---|---|
+| `Idle` | Not in voice |
+| `Joining` | `join_voice` sent; waiting up to 5s for the server's `voice_joined` |
+| `Live` | Admitted and capturing |
+| `Suspended` | WebSocket dropped mid-call; rejoin when the same room is confirmed again |
+
+### Commands (main loop → manager)
 
 | Command | Purpose |
 |---|---|
-| `Join(room_id)` | Start a voice session in the given room |
-| `Leave` | End the current voice session |
-| `Mute(bool)` | Toggle microphone on/off |
-| `Signal { sender_id, signal_type, data }` | Forward a voice signal received from the server |
+| `Join { room_id }` | Request voice in the room |
+| `Leave` | End voice, including a pending join or a suspended rejoin |
+| `Mute(bool)` | Toggle microphone |
+| `SetWsSender` | Socket for the current connection |
+| `ConnectionStatusChanged(bool)` | WebSocket up/down |
+| `RoomJoined { room_id }` | Server confirmed the chat room |
+| `ServerVoiceJoined { room_id }` / `ServerVoiceError { .. }` | Server accepted/refused a voice join |
+| `ServerAudio(payload)` | Mixed audio from the server |
 
-### Events (VoiceManager → Main Loop)
+### Events (manager → main loop)
 
 | Event | Purpose |
 |---|---|
-| `Signal { ... }` | Audio data or control signal to send to the server |
-| `Connecting` | Voice connection initiated |
-| `Connected` | Voice connection established |
-| `Disconnected` | Voice connection closed |
-| `ConnectionFailed(reason)` | Connection failed with error message |
-| `MuteStateChanged(bool)` | Mute state updated |
-| `TxActivity(bool)` | Microphone activity detected (for TX indicator) |
-| `AudioError(String)` | Audio device error |
+| `Connecting` | Join requested, waiting for the server |
+| `VoiceJoined`, `Connected` | Server admitted us and capture started |
+| `Disconnected` | Transport lost mid-call; UI shows Reconnecting |
+| `ConnectionFailed(reason)` | Join refused, timed out, or the mic failed |
+| `VoiceLeft` | Voice ended |
+| `MuteStateChanged(bool)` | Mute changed |
+| `TxActivity(bool)` | TX indicator |
+| `AudioError(String)` | Audio device or decode error |
 
-### Join Flow
+### Lifecycle
 
-1. Send `VoiceEvent::Connecting` to update UI
-2. Reset the AudioEngine (stop any existing streams)
-3. Set `is_joined = true` and store the room ID
-4. Start microphone capture via `AudioEngine.start_capture()`
-5. Spawn a task that reads encoded Opus packets from the capture channel:
-   - If muted, skip the packet
-   - Otherwise, base64-encode the Opus data and emit a `Signal` event with `type: "audio"`
-   - Emit `TxActivity(true)` to show the TX indicator
-6. Set up a playback channel (`playback_tx`) and start playback via `AudioEngine.start_playback_for_peer("server", playback_rx)`
-7. Send a `join_voice` signal to the server
-8. Send `VoiceEvent::Connected` to confirm the connection
-
-### Leave Flow
-
-1. Set `is_joined = false`
-2. Send a `leave_voice` signal to the server
-3. Reset the AudioEngine (stops all cpal streams)
-4. Clear the playback channel
-5. Reset mute state
-6. Send `TxActivity(false)`, `MuteStateChanged(false)`, and `Disconnected` events
-
-### Signal Handling
-
-The VoiceManager receives signals from the server (forwarded by the main loop). The only signal type it processes is:
-
-- **`audio`** — Base64-decode the data and send the raw Opus packet to the `playback_tx` channel. The AudioEngine's decoder task picks it up and plays it through the speakers.
-
-All other signal types are ignored (they were used by the old WebRTC architecture).
+- **Join:** send `join_voice`, enter `Joining`. On a matching `voice_joined`, start capture and go `Live`. A `voice_error` or the 5s timeout ends the attempt. The server only admits a connection that is currently in the room.
+- **Capture:** each session spawns its own mic task holding that connection's socket sender and its own sequence counter, so nothing from an old session reaches a new socket. Muted frames are skipped.
+- **Leave:** stop capture and playback, send `leave_voice` if the server knows about the session, clear mute, go `Idle`. Works in every state, so leaving during an outage cancels the rejoin.
+- **Disconnect:** stop audio and go `Suspended`, keeping mute. On reconnect the main loop rejoins the chat room; the manager rejoins voice when `RoomJoined` names the same room.
+- **Room change:** a `RoomJoined` for a different room ends voice in the old one. Navigation commands don't need their own voice cleanup.
+- **Incoming audio:** played only while `Live` and only for the live room.
 
 ## AudioEngine (`voice/audio.rs`)
 
@@ -118,13 +88,7 @@ Send to encoded_tx channel
 
 `start_capture()` creates a cpal input stream on the default input device. It prefers 48kHz (Opus native rate) but falls back to whatever the device supports.
 
-The cpal callback receives audio chunks in the device's native format. If the device is stereo, channels are averaged to mono:
-
-```rust
-let mono: Vec<f32> = data.chunks(channels)
-    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-    .collect();
-```
+Both directions pick the best supported config at an Opus-friendly rate, preferring `f32` and falling back to `i16`/`u16` devices, converting samples to and from `f32`. Captured frames are averaged to mono. Chunks go through bounded queues; if the encoder or socket falls behind, the oldest audio is dropped instead of queued.
 
 #### Resampling
 
@@ -169,7 +133,7 @@ Speakers
 
 #### Decoding
 
-Each `start_playback_for_peer()` call creates a new cpal output stream with its own decoder task:
+The first packet from a source creates its cpal output stream and decoder task; later packets reuse it through a bounded channel:
 
 ```rust
 let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono)?;
@@ -179,7 +143,7 @@ The decoder task receives Opus packets from the `packet_rx` channel, decodes the
 
 #### Buffer Management
 
-The shared buffer has a maximum size of 2 seconds of audio (`device_sample_rate * 2`). If the buffer exceeds this limit, the oldest samples are drained:
+The shared buffer holds mono samples, capped at 500ms. If it exceeds this, the oldest samples are drained:
 
 ```rust
 if buffer.len() > max_buffer_samples {
@@ -192,19 +156,11 @@ This prevents bufferbloat and keeps latency low.
 
 #### Output
 
-The cpal output callback drains samples from the shared buffer. If the buffer is empty, it fills the remainder with silence:
-
-```rust
-for i in written..data.len() {
-    data[i] = 0.0;
-}
-```
-
-This ensures the audio device always has data, preventing underrun glitches.
+The output callback (`fill_output`) pops one mono sample per device frame and copies it to every channel, so stereo devices play at the right speed. When the buffer runs dry it writes silence.
 
 ### Stream Management
 
-Output streams are keyed by peer ID in a `HashMap<String, SendStream>`. When `start_playback_for_peer()` is called for a peer that already has a stream, the old stream is replaced. When `reset()` is called, all streams are dropped.
+Output streams are keyed by source ID. `reset()` drops capture and playback; `drop_playback()` drops only playback so the next packet rebuilds it. A source whose stream fails to build is skipped for 2s, then retried.
 
 The `SendStream` wrapper is necessary because `cpal::Stream` is not `Send`, but tokio requires `Send` for spawned tasks. The wrapper implements `unsafe impl Send` because the stream is only accessed from a single thread.
 
@@ -215,7 +171,10 @@ Audio device errors are reported back to the VoiceManager via an unbounded chann
 - `OutputDeviceError` — Playback device failure (speaker disconnected, driver crash)
 - `InputDeviceError` — Capture device failure (microphone unplugged, permission revoked)
 
-The VoiceManager forwards these as `VoiceEvent::AudioError` events, which the main loop displays as status messages.
+The VoiceManager reports both as `VoiceEvent::AudioError` and recovers:
+
+- Output error: drop playback streams; they rebuild on the next packet.
+- Input error: restart capture. If it fails, or errors again within 2s of starting, voice ends with `ConnectionFailed` rather than staying falsely Connected.
 
 ## Dependencies
 
